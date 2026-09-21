@@ -1,0 +1,9 @@
+# Private runtime plane — never tracked, never distributed.
+# Whole-directory exclusion: Parquet and JSON can both carry company data.
+data/
+.env
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.DS_Store
