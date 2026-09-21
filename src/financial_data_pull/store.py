@@ -67,6 +67,22 @@ def sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
+def clean_text(text: str, limit: int) -> str:
+    """Flatten, redact and clip text on its way to an artifact.
+
+    A provider's own message is external input and gets the same treatment as
+    exception text: no credential and no full URL reaches a manifest. Redaction runs
+    before the clip, so a URL that straddles the limit cannot survive it.
+    """
+    # what is covered: `key=value` and `key: value`, and URLs with a scheme or a
+    # `www.` host. A separatorless secret and a bare domain have no reliable shape to
+    # match on, and no path here produces one.
+    message = re.sub(r"\s+", " ", text).strip()
+    message = re.sub(r"(?i)(api_?key|token|secret)\s*[=:]\s*\S+", r"\1=<redacted>", message)
+    message = re.sub(r"(?i)https?://\S+|www\.\S+", "<url>", message)
+    return message[:max(0, limit)]
+
+
 def clean_error(exc: BaseException, limit: int = 80) -> str:
     """Exception text on its way to an artifact: keep the type and a short, flat hint.
 
@@ -74,10 +90,8 @@ def clean_error(exc: BaseException, limit: int = 80) -> str:
     URL is redacted before the text can reach a manifest. Providers use this too, so
     that a failing dataset is legible without leaking the key it was called with.
     """
-    message = re.sub(r"\s+", " ", str(exc)).strip()
-    message = re.sub(r"(?i)(api_?key|apikey|token|secret)=\S+", r"\1=<redacted>", message)
-    message = re.sub(r"https?://\S+", "<url>", message)
-    return f"{type(exc).__name__}: {message[:limit]}" if message else type(exc).__name__
+    message = clean_text(str(exc), limit)
+    return f"{type(exc).__name__}: {message}" if message else type(exc).__name__
 
 
 def atomic_write_json(path: Path, obj: dict) -> None:

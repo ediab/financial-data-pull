@@ -90,6 +90,26 @@ def _row(issuer: str, dataset: str, acquisition: str, reason: str | None,
     return {k: v for k, v in row.items() if v is not None}
 
 
+def _statement_row(issuer: str, name: str, kind: str, frames: dict, meta: dict,
+                   retrieved_at: str, retrieved_detail: str | None = None) -> dict:
+    """One coverage row per statement kind: retrieved, unreadable, or not carried.
+
+    A statement that exists but cannot be converted is PARSE_FAILED with its reason;
+    reporting it as "not carried by this filing" would blame the filing for our
+    parsing problem. A statement that is genuinely absent is MISSING, never a silent
+    gap in the record — both the 10-K and the 20-F branch must speak for every kind.
+    """
+    if kind in frames:
+        return _row(issuer, name, "RETRIEVED", None, meta, frames[kind], retrieved_at,
+                    detail=retrieved_detail)
+    unreadable = (meta.get("statements_unreadable") or {}).get(kind)
+    if unreadable:
+        return _row(issuer, name, "PARSE_FAILED", "NOT_RETRIEVABLE", meta, None,
+                    retrieved_at, detail=f"statement could not be read ({unreadable})")
+    return _row(issuer, name, "MISSING", "NOT_PUBLISHED", meta, None, retrieved_at,
+                detail="statement not carried by this filing")
+
+
 def _statements_from_sec(issuer: str, ticker: str, ceiling, retrieved_at: str
                          ) -> tuple[dict[str, pd.DataFrame], dict, list[dict]]:
     """Fetch statements across filing history: 3 annual + 8 quarterly filings.
@@ -124,21 +144,11 @@ def _statements_from_sec(issuer: str, ticker: str, ceiling, retrieved_at: str
             meta[f"{freq}_{index}"] = m
             if freq == "annual":
                 annual_retrieved += 1
-            # an unreadable statement is its own failure: reporting it as "not carried
-            # by this filing" would blame the filing for our parsing problem
-            unreadable = m.get("statements_unreadable") or {}
             for kind in sec.STATEMENT_KINDS:
                 name = f"{kind}_{freq}_{index}"
                 if kind in frames:
                     tables[name] = frames[kind]
-                    rows.append(_row(issuer, name, "RETRIEVED", None, m, frames[kind], retrieved_at))
-                elif kind in unreadable:
-                    rows.append(_row(issuer, name, "PARSE_FAILED", "NOT_RETRIEVABLE", m, None,
-                                     retrieved_at,
-                                     detail=f"statement could not be read ({unreadable[kind]})"))
-                else:
-                    rows.append(_row(issuer, name, "MISSING", "NOT_PUBLISHED", m, None,
-                                     retrieved_at, detail="statement not carried by this filing"))
+                rows.append(_statement_row(issuer, name, kind, frames, m, retrieved_at))
 
     if annual_retrieved == 0:
         # foreign private issuers file 20-F annually; 6-K interims are documents,
@@ -163,8 +173,8 @@ def _statements_from_sec(issuer: str, ticker: str, ceiling, retrieved_at: str
                 if kind in frames:
                     tables[name] = frames[kind]
                     rows = [r for r in rows if r["dataset"] != name]
-                    rows.append(_row(issuer, name, "RETRIEVED", None, m, frames[kind],
-                                     retrieved_at, detail="20-F annual; interims are documents"))
+                rows.append(_statement_row(issuer, name, kind, frames, m, retrieved_at,
+                                           retrieved_detail="20-F annual; interims are documents"))
 
     return tables, meta, rows
 
@@ -430,7 +440,8 @@ def pull(ticker: str, *, issuer: str | None = None, sources=None, transcripts=No
                     # quarter is still named missing and the rest is still acquired
                     data, meta = None, {"provider": "alpha_vantage", "dataset": "av_transcript",
                                         "quarter": quarter, "status": "MISSING",
-                                        "reason": "NOT_RETRIEVABLE", "detail": str(exc)}
+                                        "reason": "NOT_RETRIEVABLE",
+                                        "detail": store.clean_error(exc)}
                     break
                 if meta.get("status") != "RATE_LIMITED" \
                         or attempt == TRANSCRIPT_RATE_LIMIT_RETRIES:

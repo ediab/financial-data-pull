@@ -30,11 +30,14 @@ from test_store import _TempPlane
 
 
 def _http(payload: dict) -> mock.MagicMock:
+    """A urlopen replacement: one fresh, readable response per call.
+
+    The stream must be new per call — a BytesIO left open by the caller is closed by
+    its own `__exit__` (monkeypatching `__exit__` on the instance does not affect the
+    implicit dunder lookup), so a shared one serves exactly one request.
+    """
     body = json.dumps(payload).encode()
-    response = io.BytesIO(body)
-    response.__enter__ = lambda self: self          # type: ignore[attr-defined]
-    response.__exit__ = lambda self, *exc: False    # type: ignore[attr-defined]
-    return mock.MagicMock(return_value=response)
+    return mock.MagicMock(side_effect=lambda *args, **kwargs: io.BytesIO(body))
 
 
 class _Sec:
@@ -264,6 +267,89 @@ def test_a_yahoo_dataset_failure_keeps_the_error_text():
         print("  a failing Yahoo dataset names its error in the coverage row ✓")
 
 
+def test_a_foreign_private_issuer_still_gets_a_row_per_statement():
+    """The 20-F branch must speak for every statement kind too: a statement the filing
+    lacks is MISSING and one that will not convert is PARSE_FAILED, never a gap."""
+
+    class _Frame:
+        def __init__(self, frame):
+            self._frame = frame
+
+        def to_dataframe(self):
+            return self._frame
+
+    class _UnreadableFrame:
+        def to_dataframe(self):
+            raise ValueError("XBRL frame is missing a context")
+
+    class _TwentyF:
+        form = "20-F"
+        filing_date = "2025-03-01"
+        period_of_report = "2024-12-31"
+        accession_no = "0000000000-25-000002"
+        income_statement = _Frame(pd.DataFrame({"concept": ["us-gaap_Revenues"],
+                                                "2024-12-31 (FY)": [1.0]}))
+        balance_sheet = _UnreadableFrame()
+        cash_flow_statement = None
+
+        def obj(self):
+            return self
+
+        def full_text_submission(self):
+            return "<filing/>"
+
+        def __getitem__(self, index):
+            if index:  # one 20-F in the history
+                raise IndexError("no more 20-F filings")
+            return self
+
+    class _NoTenK:
+        def __getitem__(self, index):
+            raise IndexError("no 10-K filings")
+
+    company = mock.MagicMock()
+    company.get_filings.side_effect = (
+        lambda form=None, **kwargs: _TwentyF() if form == "20-F" else _NoTenK())
+    with _TempPlane():
+        with mock.patch("edgar.Company", return_value=company), \
+                mock.patch.object(sec, "_identity", return_value="me"):
+            result = pull("NVDA", sources=["sec"])
+        doc = _coverage(result)
+        assert contracts.validate_against(doc, "coverage") == []
+        rows = {r["dataset"]: r for r in doc["rows"]}
+        assert rows["income_annual_0"]["acquisition"] == "RETRIEVED", rows["income_annual_0"]
+        assert rows["income_annual_0"]["label"] == ("20-F annual; interims are documents"), \
+            rows["income_annual_0"]
+        assert rows["balance_annual_0"]["acquisition"] == "PARSE_FAILED", rows["balance_annual_0"]
+        assert "missing a context" in rows["balance_annual_0"]["label"], rows["balance_annual_0"]
+        assert rows["cashflow_annual_0"]["acquisition"] == "MISSING", rows.get("cashflow_annual_0")
+        print("  a 20-F filing reports every statement: retrieved, unreadable or MISSING ✓")
+
+
+def test_an_alpha_vantage_message_is_redacted_before_it_reaches_an_artifact():
+    """A provider's own message is external input: neither a key nor a full URL from
+    it may be stored, in the row's label or in the manifest."""
+    message = ("This endpoint is on premium plans: https://www.alphavantage.co/premium/ "
+               "(apikey=SECRET123).")
+    with _TempPlane():
+        with mock.patch.object(alphavantage, "config") as cfg:
+            cfg.get.return_value = "key"
+            # no `_patched` here: both alpha_vantage calls must be the real provider
+            # code, reading a patched response, or the redaction is never exercised
+            with mock.patch.object(alphavantage.urllib.request, "urlopen",
+                                   _http({"Information": message})):
+                estimates = pull("NVDA", sources=["alpha_vantage"])
+                transcripts = pull("NVDA", sources=["alpha_vantage"],
+                                   transcripts=["2025Q1"])
+        for result, dataset in ((estimates, "av_earnings_estimates"),
+                                (transcripts, "av_transcript_2025Q1")):
+            label = next(r for r in _coverage(result)["rows"]
+                         if r["dataset"] == dataset)["label"]
+            assert "SECRET123" not in label and "alphavantage.co" not in label, label
+            assert "<url>" in label, label
+        print("  an Alpha Vantage message is redacted before it reaches an artifact ✓")
+
+
 def test_a_bogus_ticker_records_gaps_and_publishes_no_snapshot():
     with _TempPlane():
         s, y, a = _Sec(fail=True), _Yahoo(fail=True), _Estimates(fail=True)
@@ -462,6 +548,8 @@ if __name__ == "__main__":
     test_a_failing_provider_becomes_coverage_rows_not_an_exception()
     test_a_statement_that_fails_to_convert_is_parse_failed_not_absent()
     test_a_yahoo_dataset_failure_keeps_the_error_text()
+    test_a_foreign_private_issuer_still_gets_a_row_per_statement()
+    test_an_alpha_vantage_message_is_redacted_before_it_reaches_an_artifact()
     test_a_bogus_ticker_records_gaps_and_publishes_no_snapshot()
     test_a_failed_run_is_not_cached_and_the_scope_recovers()
     test_one_issuer_two_tickers_do_not_share_a_snapshot()

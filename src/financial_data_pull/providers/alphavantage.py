@@ -34,7 +34,8 @@ def earnings_estimates(symbol: str, horizon: str = "12month", issuer: str | None
                       "reason": "NOT_RETRIEVABLE", "detail": "response is not a JSON object"}
     if "Information" in data or "Error Message" in data:
         return None, {"provider": "alpha_vantage", "status": "FAILED",
-                      "reason": "NOT_RETRIEVABLE", "detail": str(data)[:200]}
+                      "reason": "NOT_RETRIEVABLE",
+                      "detail": store.clean_text(str(data), 200)}
     preserved = store.save_raw(issuer, "alpha_vantage", raw, suffix=".json") if issuer else None
     est = data.get("estimates", [])
     if not isinstance(est, list):
@@ -97,15 +98,16 @@ def earnings_call_transcript(symbol: str, quarter: str, issuer: str | None = Non
     if message:
         text = str(message)
         lowered = text.lower()
+        # classification reads the provider's own words; only the copy that is stored
+        # is redacted, so a URL or a key inside the message cannot reach a manifest
+        detail = store.clean_text(text, 200)
         if ("spreading out your free api" in lowered or "rate limit" in lowered
                 or "thank you for using alpha vantage" in lowered
                 or "requests per second" in lowered or "requests per day" in lowered):
             # the free tier throttles bursts: this is a retryable transport limit, not
             # a coverage gap, and it must never be recorded as a missing quarter
-            return None, _transcript_meta(quarter, "RATE_LIMITED", "NOT_RETRIEVABLE",
-                                          text[:200])
-        return None, _transcript_meta(quarter, "MISSING", "PREMIUM_OR_UNCOVERED",
-                                      text[:200])
+            return None, _transcript_meta(quarter, "RATE_LIMITED", "NOT_RETRIEVABLE", detail)
+        return None, _transcript_meta(quarter, "MISSING", "PREMIUM_OR_UNCOVERED", detail)
     preserved = store.save_raw(issuer, "alpha_vantage", raw, suffix=".json") if issuer else None
     transcript = data.get("transcript")
     if not isinstance(transcript, list):

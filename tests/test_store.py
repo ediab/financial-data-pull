@@ -149,6 +149,11 @@ def test_error_text_is_redacted_before_it_reaches_an_artifact():
     assert "SECRET123456" not in cleaned and "alphavantage" not in cleaned, cleaned
     assert cleaned.startswith("RuntimeError: "), cleaned
     assert store.clean_error(RuntimeError("x" * 500)) == "RuntimeError: " + "x" * 80
+    # the other shapes a key or a link arrives in, and a limit that cannot be allowed
+    # to mean "keep the tail"
+    assert "SECRET123456" not in store.clean_text("invalid apikey: SECRET123456", 200)
+    assert "alphavantage" not in store.clean_text("plans at www.alphavantage.co/x", 200)
+    assert store.clean_text("abcdefgh", 0) == "" and store.clean_text("abcdefgh", -3) == ""
     print("  error text is redacted and clipped before it reaches an artifact ✓")
 
 
