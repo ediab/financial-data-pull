@@ -3,7 +3,10 @@
 - **Date:** 2026-09-21
 - **Original request:** "create a python library that pulls financial data for a ticker from EDGAR using Edgartools and from Alpha Vantage... copy the .env from ../equity-research and the way it pulls and caches data. The goal of this project is to ONLY do the data pull / caching."
 - **Working directory:** `/Users/eliasdiab/Dev/financial_data_pull`
-- **Git:** not a Git repository. `git init` is **not** part of this plan.
+- **Git:** Git repository on `main`, remote `origin` =
+  `git@github.com:ediab/financial-data-pull.git` (**private**). Created 2026-09-21
+  with the spec, plan and `.gitignore` as the first commit (`63e9b8b`). `.env` is
+  verified ignored. Push is a normal `git push` from here on.
 - **Agreed brief:** `docs/specs/2026-09-21-financial-data-pull.md`
 - **Source of truth for all copied code:** `/Users/eliasdiab/Dev/equity-research`
 
@@ -119,10 +122,10 @@ copied `.env` (harmless, and keeps the two files diffable) but do not read it.
     `/policies`, `/templates`, `/scripts`, `/licenses`, `/UPSTREAM.md`)
 - `.env` — copy `UPSTREAM/.env` verbatim (live keys; gitignored)
 - `.env.example` — copy `UPSTREAM/.env.example` verbatim
-- `.gitignore` — copy `UPSTREAM/.gitignore`, then remove the lines for
-  `documents/`, `assignments/`, `.pi/sessions/`, `tests/tmp/`, `.pi/tasks/`.
-  Keep `data/`, `.env`, `.venv/`, `__pycache__/`, `*.pyc`, `.pytest_cache/`,
-  `.DS_Store`
+- `.gitignore` — **already written and committed** (do not recreate). It
+  contains `data/`, `.env`, `.venv/`, `__pycache__/`, `*.pyc`, `.pytest_cache/`,
+  `.DS_Store`. It is committed *before* the `.env` copy lands, which is the point:
+  the live-key file must be ignored from the moment it exists.
 - `schemas/coverage.json` — copy `UPSTREAM/schemas/coverage.json` verbatim
 - `src/financial_data_pull/__init__.py` — new, small:
 
@@ -329,6 +332,19 @@ Behaviour, in order:
    touches the network.
 5. **not refresh:** run `_cache_lookup`; if it hits, return
    `{**hit, "status": "CACHED"}` with zero network calls.
+
+   **The cache contract, stated exactly.** The scope key is
+   `(issuer, sorted(sources), sorted(transcripts))` — it contains **no date**, by
+   design. So `pull("NVDA")` today and `pull("NVDA")` tomorrow return the same
+   scope key, and tomorrow's call is `CACHED` with zero network requests. A
+   second call is only a network call when the scope key differs or `refresh=True`.
+
+   **Consequence to be explicit about: the cache never expires on its own.** It
+   has no TTL. A snapshot from a year ago is still returned as `CACHED` until the
+   caller passes `refresh=True`. That is what was asked for ("pull today, don't
+   pull again tomorrow"), and the caller controls freshness explicitly. Do **not**
+   add an implicit age-based expiry; if an age rule is ever wanted, add an
+   explicit opt-in `max_age_days=` parameter, which is a separate decision.
 6. `ceiling = Ceiling(ceilings or {})`,
    `run_id = f"{store.now_iso().replace(':', '')}-{uuid.uuid4().hex[:6]}"`,
    `retrieved_at = store.now_iso()`.
@@ -354,10 +370,15 @@ def read_table(ticker, table, *, issuer=None, run_id=None)
 - `manifest` returns the `snapshot.json` of the given `run_id`, or of the newest
   published snapshot, or raises `FileNotFoundError` naming the ticker.
 - `read_table` returns the frame via `contracts.read_verified_table`, which
-  refuses on hash mismatch. `FileNotFoundError` if the snapshot or the table
-  does not exist.
+  **raises `ValueError` when the file on disk no longer hashes to the value
+  recorded in the snapshot manifest** — a corrupted or edited table is refused,
+  never returned as if it were the evidence that was published. It also raises
+  `KeyError` for a table not in the snapshot, and `FileNotFoundError` when the
+  snapshot or the ticker does not exist. (Owner requirement 2026-09-21: a
+  mismatch must produce an error, not silently wrong numbers.)
 
-These two are the read half of "pull and cache". If they are unwanted, delete
+These two are the read half of "pull and cache" (owner requirement
+2026-09-21: keep both).
 them and nothing else changes — but then the cache is only reachable by reading
 Parquet files by hand.
 
@@ -496,11 +517,29 @@ Also confirm `git status`-equivalence by inspection: no `data/`, `.env`, or
 1. **`yfinance` is unofficial.** Yahoo changes its endpoints without notice, and
    yfinance can break outright. The upstream design already contains this: a
    yfinance failure degrades to `FAILED` coverage rows rather than an exception.
-   Do not add a fallback price source.
+   Do not add a fallback price source. **Owner decision 2026-09-21: the Yahoo
+   data is not essential, so if yfinance stops working it stops working** — the
+   library reports the datasets `FAILED` with a reason and everything else still
+   succeeds. Migration path if that day comes: **OpenBB** is already installed in
+   `UPSTREAM/.venv` with `openbb-yfinance`, `openbb-tiingo`, `openbb-fmp`,
+   `openbb-intrinio` and `openbb-sec` adapters, so a price provider can be
+   swapped behind one interface without redesigning this library. Do not act on
+   this now. Note for the record: Stooq, the commonly cited no-key alternative,
+   was checked and now serves a JavaScript browser challenge instead of CSV, so
+   it is not a drop-in replacement.
 2. **Alpha Vantage's free tier is severely rate-limited.** The default
-   `pull(ticker)` costs one estimates request. Transcripts cost one request per
-   quarter plus up to 3 retries at 1.5s+backoff spacing. A wide transcript pull
-   can exhaust a daily quota; the ceiling parameter exists for this.
+   `pull(ticker)` costs **exactly one** Alpha Vantage request (earnings
+   estimates). Transcripts cost one request per quarter plus up to 3 retries at
+   1.5s+backoff spacing, and are **opt-in only** — they are never acquired as
+   part of a default pull. A wide transcript pull can exhaust a daily quota; the
+   ceiling parameter exists for this.
+
+   **Alpha Vantage must never be used to substitute for Yahoo data.** No
+   `TIME_SERIES_DAILY` call, no AV prices, no AV fundamentals, no AV fallback
+   when a Yahoo dataset fails (owner decision 2026-09-21). Alpha Vantage is a
+   source for two datasets — `EARNINGS_ESTIMATES` and
+   `EARNINGS_CALL_TRANSCRIPT` — and nothing else. Spending AV quota to paper over
+   a Yahoo failure is explicitly out of scope.
 3. **A full `pull(ticker)` is slow.** 11 EDGAR filings, 11 full-text submissions,
    9 Yahoo datasets, 1 AV request — minutes, not seconds. Tests must never do
    this; only Unit 6 does, deliberately.
@@ -509,8 +548,9 @@ Also confirm `git status`-equivalence by inspection: no `data/`, `.env`, or
 5. **Pinned versions are load-bearing.** Upstream pins pandas/pyarrow because
    Parquet round-tripping is a correctness risk, not an implementation detail.
    Keep the pins; do not let a resolver float them.
-6. **Not a Git repository.** Nothing in this plan initialises one. If the owner
-   wants version control, `git init` plus a first commit is a separate request.
+6. **Version control is done.** The repo exists and is private; the spec, plan
+   and `.gitignore` are committed and pushed. Unit 1 onward is ordinary work on
+   `main`. Do not force-push, rewrite history, or change the remote.
 7. **`.env` holds live API keys.** It must never be committed, packaged, or
    printed. `security` is not a concern beyond this, but the `.gitignore` and the
    sdist `exclude` list are the guardrails — verify both exist in Unit 1.
@@ -520,4 +560,4 @@ Also confirm `git status`-equivalence by inspection: no `data/`, `.env`, or
 Approval gates (G0–G4), cases, assignments, proposals, source plans, the model,
 checks, valuation, delivery, memo, workbooks, Excel recalculation, locks, PDF
 extraction, document intake, company-document URL fetching, DuckDB, FRED, macro
-series, any new provider, and `git init`.
+series, any new provider, and any change to the Git remote.
