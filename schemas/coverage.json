@@ -1,0 +1,115 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": [
+    "issuer",
+    "run_id",
+    "rows"
+  ],
+  "properties": {
+    "issuer": {
+      "type": "string"
+    },
+    "run_id": {
+      "type": "string"
+    },
+    "rows": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "company",
+          "dataset",
+          "period",
+          "acquisition",
+          "verification",
+          "origin"
+        ],
+        "properties": {
+          "company": {
+            "type": "string"
+          },
+          "dataset": {
+            "type": "string"
+          },
+          "period": {
+            "type": "string"
+          },
+          "periods_observed": {
+            "type": "array"
+          },
+          "filing": {
+            "type": "string"
+          },
+          "retrieved_at": {
+            "type": "string"
+          },
+          "as_of": {
+            "type": "string"
+          },
+          "label": {
+            "type": "string"
+          },
+          "document_type": {
+            "type": "string"
+          },
+          "acquisition": {
+            "enum": [
+              "RETRIEVED",
+              "MISSING",
+              "FAILED",
+              "RATE_LIMITED",
+              "PARSE_FAILED"
+            ]
+          },
+          "verification": {
+            "enum": [
+              "CHECKED",
+              "UNCHECKED",
+              "DISCREPANCY"
+            ]
+          },
+          "origin": {
+            "enum": [
+              "AUTOMATIC",
+              "MANUAL"
+            ]
+          },
+          "reason": {
+            "type": "string",
+            "enum": [
+              "NOT_PUBLISHED",
+              "NOT_RETRIEVABLE",
+              "NOT_SUPPLIED",
+              "NOT_VERIFIED",
+              "PREMIUM_OR_UNCOVERED"
+            ]
+          }
+        },
+        "required_when": [
+          {
+            "key": "acquisition",
+            "values": [
+              "MISSING",
+              "FAILED",
+              "RATE_LIMITED",
+              "PARSE_FAILED"
+            ],
+            "require": [
+              "reason"
+            ]
+          }
+        ]
+      }
+    },
+    "recorded_at": {
+      "type": "string"
+    },
+    "snapshot_id": {
+      "type": "string"
+    },
+    "coverage_path": {
+      "type": "string"
+    }
+  }
+}
