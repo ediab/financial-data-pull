@@ -4,6 +4,8 @@ Layout (private plane, gitignored):
     data/raw/<issuer>/<provider>/<sha256>/        original payloads
     data/tables/<issuer>/<snapshot-id>/           statement/analyst tables + snapshot.json
     data/coverage/<issuer>/<run-id>.json          acquisition/verification status rows
+    data/csv/<issuer>/<table>.csv                 readable export; derived and rewritable
+    data/derived/<issuer>/                        readable views (documents, 8-K cells); derived
 
 Rules:
 - snapshots are versioned and immutable; refresh ADDS versions, never mutates
@@ -26,6 +28,8 @@ DATA = ROOT / "data"
 RAW = DATA / "raw"
 TABLES = DATA / "tables"
 COVERAGE = DATA / "coverage"
+CSV = DATA / "csv"
+DERIVED = DATA / "derived"
 
 _COMPONENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]*$")
 

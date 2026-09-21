@@ -24,14 +24,17 @@ class _TempPlane:
         self.root = Path(self._td.name)
 
     def __enter__(self):
-        self._saved = (store.RAW, store.TABLES, store.COVERAGE)
+        self._saved = (store.RAW, store.TABLES, store.COVERAGE, store.CSV, store.DERIVED)
         store.RAW = self.root / "raw"
         store.TABLES = self.root / "tables"
         store.COVERAGE = self.root / "coverage"
+        store.CSV = self.root / "csv"
+        store.DERIVED = self.root / "derived"
         return self.root
 
     def __exit__(self, *exc):
-        (store.RAW, store.TABLES, store.COVERAGE) = self._saved
+        (store.RAW, store.TABLES, store.COVERAGE, store.CSV,
+         store.DERIVED) = self._saved
         self._td.cleanup()
 
 

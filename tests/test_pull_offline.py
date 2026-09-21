@@ -10,6 +10,7 @@ another, and a failing provider degrades to coverage rows instead of raising.
 from __future__ import annotations
 
 import io
+import itertools
 import json
 import sys
 from contextlib import ExitStack
@@ -24,7 +25,7 @@ import pandas as pd
 from financial_data_pull import contracts, store
 from financial_data_pull.cli import main
 from financial_data_pull.providers import alphavantage, sec, yahoo
-from financial_data_pull.pull import manifest, pull, read_table
+from financial_data_pull.pull import export_csv, manifest, pull, read_table, scope_key
 
 from test_store import _TempPlane
 
@@ -111,12 +112,68 @@ class _Estimates:
         return data, meta
 
 
-def _patched(s, y, a) -> ExitStack:
-    """All three providers doubled: no test in this file can reach the network."""
+class _EightK:
+    """Item 2.02 8-Ks as filed: a press release each, or metadata that cannot be read."""
+
+    def __init__(self, filings=None, fail: bool = False):
+        self.calls = 0
+        self.counts: list[int] = []
+        self.fail = fail
+        self.filings = filings if filings is not None else [
+            {"accession": "0000000000-25-000010", "filing_date": "2025-02-06",
+             "items": "2.02,9.01"},
+            {"accession": "0000000000-24-000011", "filing_date": "2024-10-30",
+             "items": "2.02,9.01"},
+        ]
+
+    def __call__(self, ticker, count, issuer=None, ceiling=None):
+        self.calls += 1
+        self.counts.append(count)
+        if self.fail:
+            raise RuntimeError("8-K index unavailable")
+        records = []
+        for filing in self.filings[:count]:
+            if ceiling:
+                ceiling.spend("sec")
+            record = {**filing, "ticker": ticker, "status": "RETRIEVED", "reason": None,
+                      "detail": None, "exhibit_file": None, "exhibit_path": None}
+            if not filing.get("items"):
+                record.update(status="MISSING", reason="NOT_PUBLISHED",
+                              detail="SEC index metadata carries no items for this filing")
+            else:
+                payload = f"<html>release {filing['accession']}</html>".encode()
+                path = (store.save_raw(issuer, "sec", payload, suffix=".htm")
+                        if issuer else None)
+                record["exhibit_file"] = f"ex99-{filing['accession']}.htm"
+                record["exhibit_path"] = str(path) if path else None
+            records.append(record)
+        retrieved = [r for r in records if r["status"] == "RETRIEVED"]
+        meta = {"provider": "sec", "dataset": "sec_8k", "ticker": ticker,
+                "status": "RETRIEVED" if retrieved else "MISSING",
+                "reason": None if retrieved else "NOT_PUBLISHED",
+                "detail": None if retrieved else "no Item 2.02 8-K with a retrievable exhibit",
+                "retrieved_at": store.now_iso(), "filings": records}
+        if not retrieved:
+            return None, meta
+        columns = ("ticker", "filing_date", "accession", "items", "exhibit_file",
+                   "exhibit_path")
+        return pd.DataFrame([{k: r[k] for k in columns} for r in retrieved]), meta
+
+
+def _ageing_clock():
+    """A strictly increasing timestamp per call: two pulls in one test would otherwise
+    share a second, and which snapshot is newest would come down to its random suffix."""
+    ticks = itertools.count()
+    return mock.Mock(side_effect=lambda: f"2026-09-21T14:{next(ticks):02d}:00+0000")
+
+
+def _patched(s, y, a, e=None) -> ExitStack:
+    """All four providers doubled: no test in this file can reach the network."""
     stack = ExitStack()
     stack.enter_context(mock.patch.object(sec, "statements", s))
     stack.enter_context(mock.patch.object(yahoo, "fetch", y))
     stack.enter_context(mock.patch.object(alphavantage, "earnings_estimates", a))
+    stack.enter_context(mock.patch.object(sec, "earnings_8k", e or _EightK()))
     return stack
 
 
@@ -541,6 +598,257 @@ def test_the_cli_exits_non_zero_when_nothing_was_published():
     print("  the CLI exits non-zero when nothing was published ✓")
 
 
+def test_export_picks_the_newest_snapshot_carrying_each_table():
+    with _TempPlane():
+        s, y, a = _Sec(), _Yahoo(), _Estimates()
+        with mock.patch.object(store, "now_iso", _ageing_clock()), _patched(s, y, a):
+            everything = pull("NVDA")
+            # a later run that retrieved one table must not hide the earlier ones
+            later = pull("NVDA", sources=["alpha_vantage"])
+        exported = export_csv("NVDA")
+        assert set(exported) == set(everything["table_hashes"]), exported
+        assert exported["av_earnings_estimates"] == Path(later["snapshot_dir"]).name
+        older = {t: s for t, s in exported.items() if t != "av_earnings_estimates"}
+        assert set(older.values()) == {Path(everything["snapshot_dir"]).name}, older
+        frame = read_table("NVDA", "income_annual_0", run_id=exported["income_annual_0"])
+        csv_path = store.CSV / "NVDA" / "income_annual_0.csv"
+        assert csv_path.read_text() == frame.to_csv(index=False), csv_path
+        print("  export takes each table from the newest snapshot that carries it ✓")
+
+
+def test_the_cli_export_prints_provenance_and_makes_no_network_call():
+    with _TempPlane():
+        e = _EightK()
+        with _patched(_Sec(), _Yahoo(), _Estimates(), e), \
+                mock.patch("sys.stdout", new_callable=io.StringIO):
+            assert main(["NVDA", "--earnings-8k", "2"]) == 0, "the acquisition publishes"
+        # every provider now fails if touched: the export must ask none of them
+        s, y, a = _Sec(fail=True), _Yahoo(fail=True), _Estimates(fail=True)
+        out = io.StringIO()
+        with _patched(s, y, a, _EightK(fail=True)), mock.patch("sys.stdout", out):
+            assert main(["NVDA", "--export-csv"]) == 0, "an export is not a failed pull"
+        lines = [ln for ln in out.getvalue().splitlines() if " ← " in ln]
+        assert lines, out.getvalue()
+        for line in lines:
+            table, _, snapshot_id = line.partition(" ← ")
+            snapshot = store.TABLES / "NVDA" / snapshot_id
+            manifest_doc = json.loads((snapshot / "snapshot.json").read_text())
+            assert table in manifest_doc["table_hashes"], line
+        assert (s.calls, y.calls, a.calls) == (0, 0, 0), "the export must touch no provider"
+        assert (store.CSV / "NVDA" / "sec_8k.csv").is_file()
+        assert e.calls == 1 and e.counts == [2], (e.calls, e.counts)
+    print("  the CLI export prints provenance per table with zero network ✓")
+
+
+def test_eight_k_filings_are_archived_per_filing_and_scoped_by_depth():
+    filings = [{"accession": "0000000000-25-000010", "filing_date": "2025-02-06",
+                "items": "2.02,9.01"},
+               {"accession": "0000000000-25-000009", "filing_date": "2025-01-08",
+                "items": ""},
+               {"accession": "0000000000-24-000011", "filing_date": "2024-10-30",
+                "items": "2.02,9.01"}]
+    with _TempPlane():
+        with mock.patch.object(store, "now_iso", _ageing_clock()), \
+                _patched(_Sec(), _Yahoo(), _Estimates(), _EightK(filings)):
+            deep = pull("NVDA", eight_ks=3)
+            shallow = pull("NVDA", sources=["sec"], eight_ks=1)
+            again = pull("NVDA", sources=["sec"], eight_ks=1)
+            without = pull("NVDA", sources=["sec"])
+        assert deep["status"] == "RETRIEVED" and deep["eight_ks"] == 3, deep
+        frame = read_table("NVDA", "sec_8k", run_id=Path(deep["snapshot_dir"]).name)
+        assert list(frame["accession"]) == ["0000000000-25-000010",
+                                            "0000000000-24-000011"], frame
+        for path in frame["exhibit_path"]:
+            assert path.endswith(".htm") and Path(path).is_file(), path
+            assert Path(path).is_relative_to(store.RAW / "NVDA" / "sec"), path
+        doc = _coverage(deep)
+        assert contracts.validate_against(doc, "coverage") == []
+        rows = {r["dataset"]: r for r in doc["rows"]}
+        assert rows["sec_8k_0000000000-25-000010"]["acquisition"] == "RETRIEVED"
+        unclassifiable = rows["sec_8k_0000000000-25-000009"]
+        assert unclassifiable["acquisition"] == "MISSING", unclassifiable
+        assert unclassifiable["reason"] == "NOT_PUBLISHED", unclassifiable
+        assert "no items" in unclassifiable["label"], unclassifiable
+        held = manifest("NVDA", run_id=Path(deep["snapshot_dir"]).name)
+        assert held["eight_ks"] == 3, held
+        assert Path(held["originals"]["sec_8k_0000000000-25-000010"]).is_file()
+        # depth is part of the scope: a different count is its own acquisition
+        assert len({deep["scope_key"], shallow["scope_key"], without["scope_key"]}) == 3
+        assert shallow["status"] == "RETRIEVED" and again["status"] == "CACHED", (shallow, again)
+        exported = export_csv("NVDA")
+        assert exported["sec_8k"] == Path(shallow["snapshot_dir"]).name
+        assert (store.CSV / "NVDA" / "sec_8k.csv").is_file()
+    print("  8-K filings are archived per filing, and a shallower depth is its own scope ✓")
+
+
+def test_a_sec_run_with_no_earnings_8k_reports_the_gap():
+    with _TempPlane():
+        with _patched(_Sec(), _Yahoo(), _Estimates(), _EightK(filings=[])):
+            result = pull("NVDA", eight_ks=3)
+        assert result["status"] == "RETRIEVED", "the statements still publish"
+        assert "sec_8k" not in result["table_hashes"], result["table_hashes"]
+        row = {r["dataset"]: r for r in _coverage(result)["rows"]}["sec_8k"]
+        assert row["acquisition"] == "MISSING" and row["reason"] == "NOT_PUBLISHED", row
+    print("  an 8-K request that finds no earnings release is a named gap ✓")
+
+
+def test_eight_ks_without_the_sec_source_are_refused():
+    try:
+        pull("NVDA", sources=["yahoo"], eight_ks=2)
+    except ValueError as exc:
+        assert "sec" in str(exc), exc
+    else:
+        raise AssertionError("8-Ks come from the SEC provider")
+    print("  8-Ks without the sec source are refused rather than silently skipped ✓")
+
+
+def test_the_scope_key_is_stable_for_every_scope_that_predates_8k():
+    # the hash a pre-8-K release wrote into its manifests: changing it would make every
+    # held snapshot a cache miss and re-download the world
+    golden = "a1735af32f50d0347396ec13c508cc3ee4c4bdc2d31358c7f6933be2315c8389"
+    assert scope_key("VRT", "VRT", ["yahoo"], []) == golden
+    assert scope_key("VRT", "VRT", ["yahoo"], [], None) == golden
+    assert scope_key("VRT", "VRT", ["yahoo"], [], 0) == golden
+    assert scope_key("VRT", "VRT", ["yahoo"], [], 10) != golden
+    assert scope_key("VRT", "VRT", ["yahoo"], [], 10) \
+        != scope_key("VRT", "VRT", ["yahoo"], [], 5)
+    print("  the scope key is unchanged for pre-8-K scopes and splits by 8-K depth ✓")
+
+
+class _Exhibit:
+    """One filing attachment: filename, EDGAR document type, body (str or bytes)."""
+
+    def __init__(self, filename="ex991.htm", doc_type="EX-99.1",
+                 body="<html>release</html>", extension=None):
+        self.document = filename
+        self.document_type = doc_type
+        self.extension = extension or Path(filename).suffix
+        self.content = body
+
+
+class _Attachments:
+    """The one Attachments behaviour the provider uses: query(...).documents."""
+
+    def __init__(self, docs):
+        self._docs = docs
+
+    def query(self, expr, include_data_files=True):
+        wanted = expr.split("'")[1]
+        return self.__class__([d for d in self._docs if d.document_type == wanted])
+
+    @property
+    def documents(self):
+        return self._docs
+
+
+class _EightKSecFiling:
+    """An EntityFiling's surface: index metadata plus one filing's attachments."""
+
+    def __init__(self, accession, filing_date, items, exhibits=(), attachments_fail=False):
+        self.accession_no = accession
+        self.filing_date = filing_date
+        self.items = items
+        self._exhibits = list(exhibits)
+        self._attachments_fail = attachments_fail
+
+    @property
+    def attachments(self):
+        if self._attachments_fail:
+            raise RuntimeError("full-text submission unavailable")
+        return _Attachments(self._exhibits)
+
+
+class _EightKCompany:
+    def __init__(self, filings):
+        self._filings = filings
+        self.asked = None
+
+    def get_filings(self, form=None, amendments=True):
+        self.asked = (form, amendments)
+        return self._filings
+
+
+def test_the_sec_provider_keeps_only_item_202_filings_and_their_exhibit():
+    company = _EightKCompany([
+        _EightKSecFiling("0000000000-25-000010", "2025-02-06", "2.02,9.01",
+                         [_Exhibit(filename="deck.htm", doc_type="EX-99",
+                                   body="<html>deck</html>"), _Exhibit()]),
+        _EightKSecFiling("0000000000-25-000009", "2025-01-08", "7.01"),
+        _EightKSecFiling("0000000000-25-000008", "2024-12-19", ""),
+        _EightKSecFiling("0000000000-24-000011", "2024-10-30", "2.02,9.01",
+                         [_Exhibit(filename="release99.htm", doc_type="EX-99",
+                                   body="<html>other</html>"),
+                          _Exhibit(filename="release9901.htm", doc_type="EX-99.01")]),
+        _EightKSecFiling("0000000000-24-000010", "2024-08-01", "2.02,9.01",
+                         attachments_fail=True),
+        _EightKSecFiling("0000000000-24-000009", "2024-05-02", "2.02,9.01",
+                         [_Exhibit(body=None)]),
+        _EightKSecFiling("0000000000-24-000008", "2024-02-08", "2.02,9.01",
+                         [_Exhibit(filename="ex991.pdf", body=b"%PDF-1.4 release")]),
+    ])
+    with _TempPlane():
+        with mock.patch("edgar.Company", return_value=company), \
+                mock.patch.object(sec, "_identity", return_value="me"):
+            frame, meta = sec.earnings_8k("NVDA", 5, issuer="NVDA")
+        assert company.asked == ("8-K", False), \
+            "amendments are excluded by the query, not filtered after the fetch"
+        assert list(frame["accession"]) == ["0000000000-25-000010",
+                                            "0000000000-24-000011",
+                                            "0000000000-24-000008"], frame
+        paths = {r["accession"]: r["exhibit_path"] for r in meta["filings"]
+                 if r["exhibit_path"]}
+        assert Path(paths["0000000000-25-000010"]).read_text() == "<html>release</html>", \
+            "Exhibit 99.1 is preferred over a plain EX-99"
+        assert Path(paths["0000000000-24-000011"]).read_text() == "<html>release</html>", \
+            "EX-99.01 is preferred over a plain EX-99"
+        assert Path(paths["0000000000-24-000008"]).suffix == ".pdf", paths
+        assert Path(paths["0000000000-24-000008"]).read_bytes() == b"%PDF-1.4 release"
+        statuses = {r["accession"]: r["status"] for r in meta["filings"]}
+        assert statuses == {"0000000000-25-000010": "RETRIEVED",
+                            "0000000000-25-000008": "MISSING",
+                            "0000000000-24-000011": "RETRIEVED",
+                            "0000000000-24-000010": "FAILED",
+                            "0000000000-24-000009": "FAILED",
+                            "0000000000-24-000008": "RETRIEVED"}, statuses
+        assert "0000000000-25-000009" not in statuses, "a non-2.02 8-K is not this dataset"
+        failures = {r["accession"]: r["detail"] for r in meta["filings"]
+                    if r["status"] == "FAILED"}
+        assert "full-text submission unavailable" in failures["0000000000-24-000010"], failures
+        assert "empty" in failures["0000000000-24-000009"], failures
+    print("  the SEC provider keeps Item 2.02 filings and preserves their exhibit ✓")
+
+
+def test_export_refuses_a_snapshot_that_lost_a_recorded_table():
+    with _TempPlane():
+        with mock.patch.object(store, "now_iso", _ageing_clock()), \
+                _patched(_Sec(), _Yahoo(), _Estimates()):
+            pull("NVDA")                                     # holds the statements
+            later = pull("NVDA", sources=["alpha_vantage"])  # newer, holds one table
+        (Path(later["snapshot_dir"]) / "av_earnings_estimates.parquet").unlink()
+        try:
+            export_csv("NVDA")
+        except ValueError as exc:
+            assert "missing" in str(exc), exc
+        else:
+            raise AssertionError("a recorded file that vanished is corruption, not a gap")
+        # the older snapshot still carries the table; using it would hide the damage
+        assert not (store.CSV / "NVDA" / "av_earnings_estimates.csv").exists()
+        err = io.StringIO()
+        with mock.patch("sys.stdout", new_callable=io.StringIO), mock.patch("sys.stderr", err):
+            assert main(["NVDA", "--export-csv"]) == 1, "a corrupt store is not a zero exit"
+        assert "missing" in err.getvalue(), err.getvalue()
+    print("  export refuses a snapshot that lost a recorded table, in the API and the CLI ✓")
+
+
+def test_the_cli_refuses_export_combined_with_acquisition_flags():
+    with _TempPlane():
+        err = io.StringIO()
+        with mock.patch("sys.stderr", err), mock.patch("sys.stdout", new_callable=io.StringIO):
+            assert main(["NVDA", "--export-csv", "--earnings-8k", "10"]) == 1
+        assert "--earnings-8k" in err.getvalue(), err.getvalue()
+    print("  --export-csv refuses to silently ignore an acquisition flag ✓")
+
+
 if __name__ == "__main__":
     test_estimate_metadata_names_a_period_field_the_payload_carries()
     test_a_repeat_pull_is_cached_with_zero_provider_calls()
@@ -560,4 +868,13 @@ if __name__ == "__main__":
     test_a_repeated_quarter_is_asked_for_once()
     test_a_cached_quarter_is_reused_and_the_rest_is_acquired()
     test_the_cli_exits_non_zero_when_nothing_was_published()
+    test_export_picks_the_newest_snapshot_carrying_each_table()
+    test_the_cli_export_prints_provenance_and_makes_no_network_call()
+    test_eight_k_filings_are_archived_per_filing_and_scoped_by_depth()
+    test_a_sec_run_with_no_earnings_8k_reports_the_gap()
+    test_eight_ks_without_the_sec_source_are_refused()
+    test_the_scope_key_is_stable_for_every_scope_that_predates_8k()
+    test_the_sec_provider_keeps_only_item_202_filings_and_their_exhibit()
+    test_export_refuses_a_snapshot_that_lost_a_recorded_table()
+    test_the_cli_refuses_export_combined_with_acquisition_flags()
     print("all offline pull tests passed")

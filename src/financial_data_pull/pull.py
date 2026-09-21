@@ -1,11 +1,11 @@
 """Pull orchestration: one run = one snapshot + one coverage record.
 
 A run acquires the sources it was asked for and publishes them as one snapshot,
-scoped to (issuer, ticker, source set, transcript quarters). A snapshot becomes visible
-only after its manifest is written inside it and the directory is renamed into
-place, so a crash cannot leave a half-written snapshot that a cache-only read
-would trust. Coverage rows report what was actually fetched — never a hardcoded
-period claim — and are validated before they are published.
+scoped to (issuer, ticker, source set, transcript quarters, 8-K depth). A snapshot
+becomes visible only after its manifest is written inside it and the directory is
+renamed into place, so a crash cannot leave a half-written snapshot that a
+cache-only read would trust. Coverage rows report what was actually fetched — never
+a hardcoded period claim — and are validated before they are published.
 
 A plain run is cache-first: a snapshot already held for the same scope is
 returned with zero network calls, and fresher data is an explicit `refresh`.
@@ -267,13 +267,17 @@ class Ceiling:
                 f"{provider} request ceiling exceeded: {self.used[provider]} > {limit}")
 
 
-def scope_key(issuer: str, ticker: str, sources, transcripts) -> str:
+def scope_key(issuer: str, ticker: str, sources, transcripts, eight_ks=None) -> str:
     """Identity of what a run acquires. The ticker is part of it: one issuer can be
     pulled under two listings (an ADR and its local line), and neither may answer as
     the other's cache hit. Ceilings are excluded on purpose: a tighter cap must not
-    make already-held evidence look like a cache miss."""
+    make already-held evidence look like a cache miss. The 8-K depth is part of the
+    key only when requested, so a run that asks for none serializes exactly as it did
+    before the parameter existed and keeps answering from the snapshots already held."""
     scope = {"issuer": issuer, "ticker": ticker, "sources": sorted(set(sources)),
              "transcripts": sorted(transcripts or [])}
+    if eight_ks:
+        scope["eight_ks"] = eight_ks
     return hashlib.sha256(json.dumps(scope, sort_keys=True,
                                      separators=(",", ":")).encode()).hexdigest()
 
@@ -293,21 +297,24 @@ def _cache_lookup(issuer: str, scope_key: str) -> tuple[Path, dict] | None:
 
 
 def pull(ticker: str, *, issuer: str | None = None, sources=None, transcripts=None,
-         cache_only: bool = False, refresh: bool = False,
+         eight_ks: int | None = None, cache_only: bool = False, refresh: bool = False,
          ceilings: dict[str, int] | None = None) -> dict:
     """Acquire a snapshot for one ticker from the sources named.
 
     cache_only: never touches the network — the newest snapshot already published
     for this exact scope, or a MISSING status naming it.
     plain run: cache-first — a snapshot held for the same scope is returned with
-    zero network calls. The scope is (issuer, ticker, sources, transcripts) and
-    carries no date, so the cache does not expire on its own: a repeat pull stays
+    zero network calls. The scope is (issuer, ticker, sources, transcripts, eight_ks)
+    and carries no date, so the cache does not expire on its own: a repeat pull stays
     CACHED until the caller passes `refresh=True`.
     nothing retrieved: no snapshot is published at all — a run that acquired no
     evidence records its coverage rows and returns `FAILED`, so the scope is not
     poisoned for later plain pulls.
     refresh: ADDS a new snapshot version; published snapshots are never touched.
 
+    `eight_ks` names how many of the most recent Item 2.02 earnings 8-Ks to archive
+    with their Exhibit 99.1; it comes from the sec source and is part of the scope,
+    so a run of a different depth is a miss rather than a silently thinner answer.
     `ceilings` names per-provider request limits to enforce, for example
     {"alpha_vantage": 10}. Requests are counted and returned either way.
     """
@@ -319,13 +326,18 @@ def pull(ticker: str, *, issuer: str | None = None, sources=None, transcripts=No
             raise ValueError(f"unknown source {source!r}; expected one of {list(SOURCES)}")
     # a repeated quarter would spend a second request and write a second coverage row
     transcripts = list(dict.fromkeys(q for q in (transcripts or []) if q))
+    eight_ks = int(eight_ks or 0)
+    if eight_ks < 0:
+        raise ValueError("eight_ks is a count of filings and cannot be negative")
     if cache_only and refresh:
         raise ValueError("cache_only and refresh cannot be combined")
     if transcripts and "alpha_vantage" not in sources:
         raise ValueError("transcripts come from alpha_vantage; name it in sources")
+    if eight_ks and "sec" not in sources:
+        raise ValueError("8-Ks come from sec; name it in sources")
     issuer = issuer or ticker
     store.safe_component(issuer, "issuer")
-    key = scope_key(issuer, ticker, sources, transcripts)
+    key = scope_key(issuer, ticker, sources, transcripts, eight_ks)
 
     if cache_only:
         hit = _cache_lookup(issuer, key)
@@ -367,6 +379,37 @@ def pull(ticker: str, *, issuer: str | None = None, sources=None, transcripts=No
         provider_meta["sec"] = {"status": "RETRIEVED" if st_tables else "FAILED", "filings": st_meta}
         originals.update({k: v["original_path"] for k, v in st_meta.items()
                           if isinstance(v, dict) and v.get("original_path")})
+
+        # --- earnings 8-Ks (opt-in): Item 2.02 filings and their press releases ---
+        if eight_ks:
+            try:
+                eight_frame, eight_meta = sec.earnings_8k(ticker, eight_ks, issuer=issuer,
+                                                          ceiling=ceiling)
+            except PermissionError:
+                raise  # an approval/ceiling refusal is not a data problem
+            except Exception as e:  # noqa: BLE001
+                eight_frame, eight_meta = None, {
+                    "provider": "sec", "dataset": "sec_8k", "ticker": ticker,
+                    "status": "FAILED", "reason": "NOT_RETRIEVABLE",
+                    "detail": store.clean_error(e), "filings": [],
+                    "retrieved_at": retrieved_at}
+            provider_meta["sec_8k"] = eight_meta
+            # one row per filing: the aggregated statuses dict would otherwise
+            # collapse the filings into a single entry
+            for record in eight_meta.get("filings") or []:
+                rows.append(_row(issuer, f"sec_8k_{record['accession']}", record["status"],
+                                 record.get("reason"),
+                                 {"ticker": ticker, "filing_date": record.get("filing_date"),
+                                  "accession": record.get("accession")},
+                                 None, retrieved_at, detail=record.get("detail")))
+                if record.get("exhibit_path"):
+                    originals[f"sec_8k_{record['accession']}"] = record["exhibit_path"]
+            if eight_frame is not None:
+                tables["sec_8k"] = eight_frame
+            else:
+                rows.append(_row(issuer, "sec_8k", eight_meta.get("status") or "MISSING",
+                                 eight_meta.get("reason") or "NOT_RETRIEVABLE", {}, None,
+                                 retrieved_at, detail=eight_meta.get("detail")))
 
     # --- Yahoo analyst snapshot datasets ---
     if "yahoo" in sources:
@@ -471,13 +514,13 @@ def pull(ticker: str, *, issuer: str | None = None, sources=None, transcripts=No
     if violations:
         return {"status": "CONTRACT_VIOLATION", "issuer": issuer, "violations": violations}
 
-    result = _publish_snapshot(ticker, issuer, sources, transcripts, key, run_id,
+    result = _publish_snapshot(ticker, issuer, sources, transcripts, eight_ks, key, run_id,
                                retrieved_at, rows, tables, provider_meta, originals)
     return {**result, "requests": ceiling.used}
 
 
 def _publish_snapshot(ticker: str, issuer: str, sources: list[str], transcripts,
-                      key: str, run_id: str, retrieved_at: str, rows: list[dict],
+                      eight_ks: int, key: str, run_id: str, retrieved_at: str, rows: list[dict],
                       tables: dict[str, pd.DataFrame], provider_meta: dict[str, dict],
                       originals: dict[str, str]) -> dict:
     """Record coverage, and publish a snapshot when the run retrieved something.
@@ -504,6 +547,7 @@ def _publish_snapshot(ticker: str, issuer: str, sources: list[str], transcripts,
         return {"ticker": ticker, "issuer": issuer, "status": "FAILED",
                 "coverage_path": str(cov_target), "scope_key": key,
                 "sources": sorted(sources), "transcripts": sorted(transcripts or []),
+                "eight_ks": eight_ks,
                 "table_hashes": {}, "statuses": statuses, "open_gaps": gaps}
 
     # --- stage the snapshot, then publish it atomically ---
@@ -519,6 +563,7 @@ def _publish_snapshot(ticker: str, issuer: str, sources: list[str], transcripts,
         "run_id": run_id,
         "sources": sorted(sources),
         "transcripts": sorted(transcripts or []),
+        "eight_ks": eight_ks,
         "scope_key": key,
         "retrieved_at": retrieved_at,
         "providers": provider_meta,
@@ -536,6 +581,7 @@ def _publish_snapshot(ticker: str, issuer: str, sources: list[str], transcripts,
             "snapshot_dir": str(snap_dir), "coverage_path": str(cov_target),
             "scope_key": key,
             "sources": sorted(sources), "transcripts": sorted(transcripts or []),
+            "eight_ks": eight_ks,
             "table_hashes": table_hashes, "statuses": statuses, "open_gaps": gaps}
 
 
@@ -569,3 +615,36 @@ def read_table(ticker: str, table: str, *, issuer: str | None = None,
     if snap is None:
         raise FileNotFoundError(f"no snapshot for {ticker!r}")
     return contracts.read_verified_table(snap, table)
+
+
+def export_csv(issuer: str, out_dir=None) -> dict[str, str]:
+    """One CSV per table, each from the newest snapshot that carries it.
+
+    A table exists in a snapshot only because that run retrieved it, so the newest
+    snapshot carrying a table is the newest good copy — a later run that acquired
+    something else must not hide it. Reads go through the same hash check as any
+    other table read: a mismatched hash, or a recorded file that has vanished, is
+    refused rather than quietly replaced by an older snapshot. Returns
+    {table: snapshot id}; makes no network call.
+    """
+    store.safe_component(issuer, "issuer")
+    out = Path(out_dir) if out_dir else store.CSV / issuer
+    out.mkdir(parents=True, exist_ok=True)
+    exported: dict[str, str] = {}
+    for snap in reversed(store.snapshot_dirs(issuer)):  # newest first
+        manifest = json.loads((snap / "snapshot.json").read_text())
+        for table in sorted(manifest.get("table_hashes") or {}):
+            if table in exported:
+                continue
+            try:
+                frame = contracts.read_verified_table(snap, table)
+            except KeyError as exc:
+                # The manifest names this table, so the only KeyError left is the file it
+                # recorded having vanished — corruption, not a snapshot that lacks the
+                # table (snapshots lacking it are skipped by their manifest keys above).
+                raise ValueError(
+                    f"snapshot {snap.name} records the table {table!r} but its parquet "
+                    f"is missing — refusing to export a partial snapshot") from exc
+            frame.to_csv(out / f"{table}.csv", index=False, encoding="utf-8")
+            exported[table] = snap.name
+    return exported
