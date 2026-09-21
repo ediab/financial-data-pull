@@ -11,6 +11,7 @@ import logging
 import sys
 from pathlib import Path
 
+from . import store
 from .pull import SOURCES, export_csv, pull
 from .views import export_views
 
@@ -115,9 +116,61 @@ def _export_views(issuer: str) -> int:
     return 0
 
 
+def _index(issuer: str | None) -> int:
+    """One summary block per issuer from its coverage files; zero network.
+
+    Run-ids begin with an ISO timestamp, so sorting the filenames sorts by time.
+    Rows are aggregated across every recorded run: a per-source snapshot (an
+    SEC-only pull, a Yahoo refresh) publishes its own coverage file, so the
+    union of the rows — not the newest file alone — is what the issuer holds.
+    """
+    if not store.COVERAGE.is_dir():
+        print("nothing held — no coverage directory", file=sys.stderr)
+        return 0
+    names = [issuer] if issuer else sorted(
+        p.name for p in store.COVERAGE.iterdir() if p.is_dir())
+    printed = False
+    for name in names:
+        files = sorted(store.COVERAGE.joinpath(name).glob("*.json"))
+        if not files:
+            print(f"{name}: no coverage recorded", file=sys.stderr)
+            continue
+        newest = json.loads(files[-1].read_text())
+        rows: dict[tuple[str, str], dict] = {}
+        for path in files:
+            for row in json.loads(path.read_text()).get("rows", []):
+                rows[(row["dataset"], row["period"])] = row
+        printed = True
+        print(f"{name} — {len(files)} pull(s) held — last "
+              f"{newest.get('recorded_at', '?')}")
+        held = list(rows.values())
+        held_rows = list(rows.values())
+        filings = sorted({r["period"] for r in held_rows
+                          if r["dataset"].startswith(("income_", "balance_", "cashflow_"))})
+        eight_ks = sorted(r["period"] for r in held_rows if r["dataset"].startswith("sec_8k"))
+        transcripts = sorted(r["period"] for r in held_rows
+                             if r["dataset"].startswith("av_transcript"))
+        snapshot_sets = sorted(r["dataset"] for r in held_rows if r["period"] == "snapshot")
+        if filings:
+            print(f"  statements: {len(filings)} filings ({filings[0]} … {filings[-1]})")
+        if eight_ks:
+            print(f"  earnings 8-Ks: {len(eight_ks)} ({eight_ks[0]} … {eight_ks[-1]})")
+        if transcripts:
+            print(f"  transcripts: {transcripts[0]} … {transcripts[-1]} "
+                  f"({len(transcripts)} quarters)")
+        if snapshot_sets:
+            print(f"  snapshot datasets: {', '.join(snapshot_sets)}")
+        for r in sorted(held_rows, key=lambda r: r["dataset"]):
+            if r["acquisition"] != "RETRIEVED":
+                print(f"  {r['acquisition']}: {r['dataset']} — {r.get('reason', '')}")
+    if not printed:
+        print("nothing held yet — run a pull first", file=sys.stderr)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="financial-data-pull")
-    p.add_argument("ticker")
+    p.add_argument("ticker", nargs="?", default=None)
     p.add_argument("--issuer", default=None,
                    help="store name when it differs from the ticker")
     p.add_argument("--sources", default=None,
@@ -140,6 +193,10 @@ def main(argv: list[str] | None = None) -> int:
                         "Markdown file per call transcript, and 8k_cells.csv with one row per "
                         "cell of every release table; no network, and not combinable with "
                         "acquisition flags")
+    p.add_argument("--index", action="store_true",
+                   help="print what is held per issuer — last pull, filings, 8-K and "
+                        "transcript quarters, snapshot datasets, degraded rows — from "
+                        "the newest coverage file; zero network")
     p.add_argument("--refresh", action="store_true", help="add a new snapshot version")
     p.add_argument("--cache-only", action="store_true", help="zero network requests")
     p.add_argument("--quiet", action="store_true",
@@ -151,6 +208,23 @@ def main(argv: list[str] | None = None) -> int:
     args = p.parse_args(argv)
 
     _setup_logging(args.quiet)
+
+    if args.index:
+        ignored = [name for name, given in (("--refresh", args.refresh),
+                                           ("--sources", args.sources),
+                                           ("--transcripts", args.transcripts),
+                                           ("--earnings-8k", args.earnings_8k),
+                                           ("--ceiling", args.ceiling),
+                                           ("--cache-only", args.cache_only),
+                                           ("--export-csv", args.export_csv),
+                                           ("--export-views", args.export_views)) if given]
+        if ignored:
+            print(f"--index reads only what is held and cannot be combined with "
+                  f"{', '.join(ignored)}", file=sys.stderr)
+            return 1
+        return _index(args.issuer or args.ticker)
+    if not args.ticker:
+        p.error("a ticker is required unless --index")
 
     if args.export_csv or args.export_views:
         flags = [flag for flag, given in (("--export-csv", args.export_csv),

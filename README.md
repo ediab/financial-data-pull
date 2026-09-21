@@ -39,6 +39,7 @@ details.
 .venv/bin/financial-data-pull NVDA --quiet                # warnings only
 .venv/bin/financial-data-pull NVDA --export-csv           # CSVs, zero network
 .venv/bin/financial-data-pull NVDA --export-views         # derived views, zero network
+.venv/bin/financial-data-pull --index                     # what is held, all tickers
 ```
 
 The JSON result is printed to stdout. One line per dataset (INFO) and one human
@@ -147,6 +148,13 @@ they are rebuilt from the store on demand, and a downstream reader cites the sna
 not the view. 10-K and 10-Q primary documents are deliberately not copied here: their
 only original is a ~9 MB full-text submission, and their statements are already in
 `data/csv/`.
+
+`--index` (optionally with a ticker, and never combined with other flags) prints one
+block per issuer, aggregating the rows of every coverage file it has recorded: how
+many pulls are held and when the last one ran, the filing range behind the statements,
+the 8-K dates, the transcript quarters, the snapshot datasets, and one line per
+degraded (`MISSING`/`FAILED`/…) row. It is generated, so it cannot go stale the way
+a hand-written index would.
 
 ## Properties
 
