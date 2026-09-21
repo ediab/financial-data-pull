@@ -24,12 +24,15 @@ memo and workbook work belongs in the consuming project.
   for. A change near `save_raw`, `commit_snapshot` or `read_verified_table` earns a
   test that goes red when the guarantee breaks.
 - **Scope is per source set.** `sources=["yahoo"]` and `sources=["sec"]` publish
-  separate snapshots with separate cache keys, which is what keeps a price refresh
-  from re-pulling 11 filings. Keep the split.
+  separate snapshots with separate cache keys — the key is issuer + ticker + source
+  set + transcript quarters — which is what keeps a price refresh from re-pulling 11
+  filings. Keep the split.
 - **The cache has no TTL.** Freshness is the caller's `refresh=True`; an age rule
   would arrive as a new opt-in parameter, never as a change to the default.
-- **Keys stay out of artifacts.** `.env` is gitignored, and `_clean_error` redacts
-  credentials and URLs before exception text reaches a manifest.
+- **Keys stay out of artifacts.** `.env` is gitignored, and `store.clean_error`
+  redacts credentials and URLs before exception text reaches a manifest — providers
+  use it too, so a failing dataset is legible without leaking the key it was called
+  with.
 - **Pins are load-bearing.** Dependency versions move deliberately, with the
   Parquet round-trip in mind.
 

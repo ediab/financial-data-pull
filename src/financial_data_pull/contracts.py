@@ -1,9 +1,11 @@
 """Minimal JSON-contract validation helpers.
 
-One contract: `schemas/coverage.json`. These helpers check what it declares —
-required keys, a single type per property, enums, array items and `required_when`
-conditionals — and are deliberately not a general JSON-Schema engine. Sounding
-exhaustive about everything else would be a promise this code does not keep.
+One contract: `schemas/coverage.json`, inside the package so that an installed copy
+validates against the same file the checkout does. These helpers check what it
+declares — required keys, a single type per property, enums, array items and
+`required_when` conditionals — and are deliberately not a general JSON-Schema
+engine. Sounding exhaustive about everything else would be a promise this code does
+not keep.
 """
 from __future__ import annotations
 
@@ -13,9 +15,10 @@ from typing import Any
 
 import pandas as pd
 
-# Contracts live at the repository root: the single source of truth for the shapes
-# this package reads and writes.
-SCHEMA_DIR = Path(__file__).resolve().parent.parent.parent / "schemas"
+# Contracts travel with the package (`financial_data_pull/schemas/`): one source of
+# truth for the shapes this package reads and writes, reachable from a wheel as
+# well as from the checkout.
+SCHEMA_DIR = Path(__file__).resolve().parent / "schemas"
 
 _TYPE_CHECKS = {
     "string": lambda v: isinstance(v, str),

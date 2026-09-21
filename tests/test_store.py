@@ -135,6 +135,23 @@ def test_save_raw_is_content_addressed_and_re_verified():
         print("  raw payloads are content-addressed and re-verified on write ✓")
 
 
+def test_the_contract_travels_with_the_package():
+    """A wheel carries the package directory: the schema must live inside it, not
+    beside the checkout, or an installed copy cannot validate anything."""
+    assert (contracts.SCHEMA_DIR / "coverage.json").is_file()
+    assert contracts.SCHEMA_DIR.parent == Path(contracts.__file__).resolve().parent
+    print("  the coverage contract is packaged with the code, not the checkout ✓")
+
+
+def test_error_text_is_redacted_before_it_reaches_an_artifact():
+    cleaned = store.clean_error(RuntimeError(
+        "HTTP 403 for https://www.alphavantage.co/query?apikey=SECRET123456"))
+    assert "SECRET123456" not in cleaned and "alphavantage" not in cleaned, cleaned
+    assert cleaned.startswith("RuntimeError: "), cleaned
+    assert store.clean_error(RuntimeError("x" * 500)) == "RuntimeError: " + "x" * 80
+    print("  error text is redacted and clipped before it reaches an artifact ✓")
+
+
 def test_the_coverage_contract_rejects_what_it_declares():
     valid = {"issuer": "TEST", "run_id": "snap-1",
              "rows": [{"company": "TEST", "dataset": "sec_annual_0",
@@ -160,5 +177,7 @@ if __name__ == "__main__":
     test_a_changed_table_file_is_refused()
     test_safe_component_rejects_escapes()
     test_save_raw_is_content_addressed_and_re_verified()
+    test_error_text_is_redacted_before_it_reaches_an_artifact()
+    test_the_contract_travels_with_the_package()
     test_the_coverage_contract_rejects_what_it_declares()
     print("all store tests passed")

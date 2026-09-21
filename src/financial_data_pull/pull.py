@@ -1,7 +1,7 @@
 """Pull orchestration: one run = one snapshot + one coverage record.
 
 A run acquires the sources it was asked for and publishes them as one snapshot,
-scoped to (issuer, source set, transcript quarters). A snapshot becomes visible
+scoped to (issuer, ticker, source set, transcript quarters). A snapshot becomes visible
 only after its manifest is written inside it and the directory is renamed into
 place, so a crash cannot leave a half-written snapshot that a cache-only read
 would trust. Coverage rows report what was actually fetched — never a hardcoded
@@ -46,18 +46,6 @@ TRANSCRIPT_RATE_LIMIT_RETRIES = 3
 # (standard_concept, level, abstract, is_breakdown, …) are not periods.
 PERIOD_COLUMN = re.compile(r"^\d{4}-\d{2}-\d{2} \((Q\d|FY|YTD)\)$")
 POINT_IN_TIME = re.compile(r"^\d{4}-\d{2}-\d{2}$")
-
-
-def _clean_error(exc: BaseException, limit: int = 80) -> str:
-    """Exception text is untrusted input: keep the type and a short, flat hint.
-
-    Truncating is not sanitising, so anything that looks like a credential or a
-    full URL is redacted before the text can reach a manifest.
-    """
-    message = re.sub(r"\s+", " ", str(exc)).strip()
-    message = re.sub(r"(?i)(api_?key|apikey|token|secret)=\S+", r"\1=<redacted>", message)
-    message = re.sub(r"https?://\S+", "<url>", message)
-    return f"{type(exc).__name__}: {message[:limit]}" if message else type(exc).__name__
 
 
 def _period_labels(df: pd.DataFrame | None, dataset: str = "") -> list[str]:
@@ -125,7 +113,7 @@ def _statements_from_sec(issuer: str, ticker: str, ceiling, retrieved_at: str
             except PermissionError:
                 raise  # an approval/ceiling refusal is not a data problem
             except Exception as e:  # noqa: BLE001
-                detail = _clean_error(e)
+                detail = store.clean_error(e)
                 key = f"{freq}_{index}"
                 meta[key] = {"ticker": ticker, "form": form, "status": "FAILED", "detail": detail}
                 rows.append(_row(issuer, f"sec_{freq}_{index}", "FAILED", "NOT_RETRIEVABLE",
@@ -136,11 +124,18 @@ def _statements_from_sec(issuer: str, ticker: str, ceiling, retrieved_at: str
             meta[f"{freq}_{index}"] = m
             if freq == "annual":
                 annual_retrieved += 1
+            # an unreadable statement is its own failure: reporting it as "not carried
+            # by this filing" would blame the filing for our parsing problem
+            unreadable = m.get("statements_unreadable") or {}
             for kind in sec.STATEMENT_KINDS:
                 name = f"{kind}_{freq}_{index}"
                 if kind in frames:
                     tables[name] = frames[kind]
                     rows.append(_row(issuer, name, "RETRIEVED", None, m, frames[kind], retrieved_at))
+                elif kind in unreadable:
+                    rows.append(_row(issuer, name, "PARSE_FAILED", "NOT_RETRIEVABLE", m, None,
+                                     retrieved_at,
+                                     detail=f"statement could not be read ({unreadable[kind]})"))
                 else:
                     rows.append(_row(issuer, name, "MISSING", "NOT_PUBLISHED", m, None,
                                      retrieved_at, detail="statement not carried by this filing"))
@@ -154,7 +149,7 @@ def _statements_from_sec(issuer: str, ticker: str, ceiling, retrieved_at: str
             except PermissionError:
                 raise
             except Exception as e:  # noqa: BLE001
-                detail = _clean_error(e)
+                detail = store.clean_error(e)
                 key = f"annual_{index}"
                 meta[key] = {**meta.get(key, {}), "form": "20-F", "fallback_detail": detail}
                 rows = [r for r in rows if r["dataset"] != f"sec_annual_{index}"]
@@ -262,10 +257,12 @@ class Ceiling:
                 f"{provider} request ceiling exceeded: {self.used[provider]} > {limit}")
 
 
-def scope_key(issuer: str, sources, transcripts) -> str:
-    """Identity of what a run acquires. Ceilings are excluded on purpose: a
-    tighter cap must not make already-held evidence look like a cache miss."""
-    scope = {"issuer": issuer, "sources": sorted(set(sources)),
+def scope_key(issuer: str, ticker: str, sources, transcripts) -> str:
+    """Identity of what a run acquires. The ticker is part of it: one issuer can be
+    pulled under two listings (an ADR and its local line), and neither may answer as
+    the other's cache hit. Ceilings are excluded on purpose: a tighter cap must not
+    make already-held evidence look like a cache miss."""
+    scope = {"issuer": issuer, "ticker": ticker, "sources": sorted(set(sources)),
              "transcripts": sorted(transcripts or [])}
     return hashlib.sha256(json.dumps(scope, sort_keys=True,
                                      separators=(",", ":")).encode()).hexdigest()
@@ -293,25 +290,32 @@ def pull(ticker: str, *, issuer: str | None = None, sources=None, transcripts=No
     cache_only: never touches the network — the newest snapshot already published
     for this exact scope, or a MISSING status naming it.
     plain run: cache-first — a snapshot held for the same scope is returned with
-    zero network calls. The scope is (issuer, sources, transcripts) and carries
-    no date, so the cache does not expire on its own: a repeat pull stays CACHED
-    until the caller passes `refresh=True`.
+    zero network calls. The scope is (issuer, ticker, sources, transcripts) and
+    carries no date, so the cache does not expire on its own: a repeat pull stays
+    CACHED until the caller passes `refresh=True`.
+    nothing retrieved: no snapshot is published at all — a run that acquired no
+    evidence records its coverage rows and returns `FAILED`, so the scope is not
+    poisoned for later plain pulls.
     refresh: ADDS a new snapshot version; published snapshots are never touched.
 
     `ceilings` names per-provider request limits to enforce, for example
     {"alpha_vantage": 10}. Requests are counted and returned either way.
     """
-    sources = list(sources or SOURCES)
+    sources = list(SOURCES) if sources is None else list(sources)
+    if not sources:
+        raise ValueError(f"sources must name at least one of {list(SOURCES)}")
     for source in sources:
         if source not in SOURCES:
             raise ValueError(f"unknown source {source!r}; expected one of {list(SOURCES)}")
+    # a repeated quarter would spend a second request and write a second coverage row
+    transcripts = list(dict.fromkeys(q for q in (transcripts or []) if q))
     if cache_only and refresh:
         raise ValueError("cache_only and refresh cannot be combined")
     if transcripts and "alpha_vantage" not in sources:
         raise ValueError("transcripts come from alpha_vantage; name it in sources")
     issuer = issuer or ticker
     store.safe_component(issuer, "issuer")
-    key = scope_key(issuer, sources, transcripts)
+    key = scope_key(issuer, ticker, sources, transcripts)
 
     if cache_only:
         hit = _cache_lookup(issuer, key)
@@ -361,7 +365,7 @@ def pull(ticker: str, *, issuer: str | None = None, sources=None, transcripts=No
         except PermissionError:
             raise
         except Exception as e:  # noqa: BLE001 — provider-level failure degrades to coverage rows
-            detail = _clean_error(e)
+            detail = store.clean_error(e)
             yf_frames = {}
             yf_meta = {"statuses": {name: "FAILED" for name in yahoo.DATASETS},
                        "reasons": {name: "NOT_RETRIEVABLE" for name in yahoo.DATASETS},
@@ -369,10 +373,11 @@ def pull(ticker: str, *, issuer: str | None = None, sources=None, transcripts=No
         provider_meta["yahoo"] = yf_meta
         tables.update(yf_frames)
         originals.update(yf_meta.get("originals") or {})
+        failures = yf_meta.get("failures") or {}
         for name, status in yf_meta["statuses"].items():
             rows.append(_row(issuer, name, status, (yf_meta.get("reasons") or {}).get(name),
                              {}, yf_frames.get(name), retrieved_at,
-                             detail=yf_meta.get("detail")))
+                             detail=failures.get(name) or yf_meta.get("detail")))
 
     # --- Alpha Vantage estimates (reports a missing key rather than raising) ---
     if "alpha_vantage" in sources:
@@ -382,7 +387,7 @@ def pull(ticker: str, *, issuer: str | None = None, sources=None, transcripts=No
             raise
         except Exception as e:  # noqa: BLE001
             av_data, av_meta = None, {"status": "FAILED", "reason": "NOT_RETRIEVABLE",
-                                      "detail": _clean_error(e)}
+                                      "detail": store.clean_error(e)}
         provider_meta["alpha_vantage"] = av_meta
         rows.append(_row(issuer, "av_earnings_estimates", av_meta.get("status", "MISSING"),
                          av_meta.get("reason"), {}, None, retrieved_at,
@@ -393,14 +398,13 @@ def pull(ticker: str, *, issuer: str | None = None, sources=None, transcripts=No
             originals["av_earnings_estimates"] = av_meta["original_path"]
 
     # --- earnings-call transcripts: one quarter at a time, one row each ---
-    wanted = [q for q in (transcripts or []) if q]
     held = {} if refresh else held_transcript_quarters(issuer)
     live_calls = 0
     segments: list[dict] = []
     missing: list[str] = []
-    if wanted:
+    if transcripts:
         spacing = TRANSCRIPT_MIN_INTERVAL_SECONDS
-        for quarter in wanted:
+        for quarter in transcripts:
             if quarter in held:
                 snap_dir, original = held[quarter]
                 rows.append(_transcript_row(issuer, quarter, {"status": "RETRIEVED"},
@@ -456,16 +460,41 @@ def pull(ticker: str, *, issuer: str | None = None, sources=None, transcripts=No
     if violations:
         return {"status": "CONTRACT_VIOLATION", "issuer": issuer, "violations": violations}
 
-    result = _publish_snapshot(ticker, issuer, sources, transcripts, run_id, retrieved_at,
-                               rows, tables, provider_meta, originals)
+    result = _publish_snapshot(ticker, issuer, sources, transcripts, key, run_id,
+                               retrieved_at, rows, tables, provider_meta, originals)
     return {**result, "requests": ceiling.used}
 
 
 def _publish_snapshot(ticker: str, issuer: str, sources: list[str], transcripts,
-                      run_id: str, retrieved_at: str, rows: list[dict],
+                      key: str, run_id: str, retrieved_at: str, rows: list[dict],
                       tables: dict[str, pd.DataFrame], provider_meta: dict[str, dict],
                       originals: dict[str, str]) -> dict:
-    """Stage, hash and atomically publish one snapshot, then record coverage."""
+    """Record coverage, and publish a snapshot when the run retrieved something.
+
+    Every RETRIEVED dataset contributes a table, so an empty `tables` means the run
+    acquired nothing: its coverage document is still written — the gaps are the
+    record of what was attempted — but no snapshot is published. This cache has no
+    TTL, so publishing an evidence-free run would answer every later plain pull with
+    `CACHED` and zero network calls.
+
+    `key` is the scope key the caller looked the cache up with, so the manifest can
+    never record a key that differs from the one a later pull searches for.
+    """
+    cov_target = store.coverage_path(issuer, run_id)
+    statuses = {r["dataset"]: r["acquisition"] for r in rows}
+    gaps = [f"{r['dataset']}: {r.get('reason') or r['acquisition']}"
+            for r in rows if r["acquisition"] != "RETRIEVED"]
+    coverage_doc = {"issuer": issuer, "run_id": run_id, "recorded_at": retrieved_at,
+                    "rows": rows}
+    if not tables:
+        # no snapshot_id: it names the snapshot that would carry this coverage, and
+        # this run published none
+        store.atomic_write_json(cov_target, coverage_doc)
+        return {"ticker": ticker, "issuer": issuer, "status": "FAILED",
+                "coverage_path": str(cov_target), "scope_key": key,
+                "sources": sorted(sources), "transcripts": sorted(transcripts or []),
+                "table_hashes": {}, "statuses": statuses, "open_gaps": gaps}
+
     # --- stage the snapshot, then publish it atomically ---
     staging = store.staging_dir(issuer, run_id)
     table_hashes: dict[str, str] = {}
@@ -473,8 +502,6 @@ def _publish_snapshot(ticker: str, issuer: str, sources: list[str], transcripts,
         df.to_parquet(staging / f"{name}.parquet")
         table_hashes[name] = store.sha256_file(staging / f"{name}.parquet")
 
-    cov_target = store.coverage_path(issuer, run_id)
-    key = scope_key(issuer, sources, transcripts)
     manifest = {
         "issuer": issuer,
         "ticker": ticker,
@@ -492,21 +519,13 @@ def _publish_snapshot(ticker: str, issuer: str, sources: list[str], transcripts,
     snap_dir = store.commit_snapshot(staging, run_id)
 
     # coverage is renamed into place only after the snapshot it describes exists
-    cov_tmp = cov_target.with_name(f".pending-{cov_target.name}")
-    store.atomic_write_json(cov_tmp, {"issuer": issuer, "run_id": run_id,
-                                      "recorded_at": retrieved_at, "rows": rows,
-                                      "snapshot_id": run_id})
-    cov_tmp.replace(cov_target)
+    store.atomic_write_json(cov_target, {**coverage_doc, "snapshot_id": run_id})
 
-    gaps = [f"{r['dataset']}: {r.get('reason') or r['acquisition']}"
-            for r in rows if r["acquisition"] != "RETRIEVED"]
     return {"ticker": ticker, "issuer": issuer, "status": "RETRIEVED",
             "snapshot_dir": str(snap_dir), "coverage_path": str(cov_target),
             "scope_key": key,
             "sources": sorted(sources), "transcripts": sorted(transcripts or []),
-            "table_hashes": table_hashes,
-            "statuses": {r["dataset"]: r["acquisition"] for r in rows},
-            "open_gaps": gaps}
+            "table_hashes": table_hashes, "statuses": statuses, "open_gaps": gaps}
 
 
 def manifest(ticker: str, *, issuer: str | None = None, run_id: str | None = None) -> dict:

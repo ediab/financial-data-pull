@@ -22,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import pandas as pd
 
 from financial_data_pull import contracts, store
+from financial_data_pull.cli import main
 from financial_data_pull.providers import alphavantage, sec, yahoo
 from financial_data_pull.pull import manifest, pull, read_table
 
@@ -202,12 +203,73 @@ def test_a_failing_provider_becomes_coverage_rows_not_an_exception():
         print("  a provider failure is FAILED rows with a reason, not an exception ✓")
 
 
-def test_a_bogus_ticker_publishes_a_valid_coverage_document():
+class _UnreadableFiling:
+    """One filing whose income statement exists but raises when converted to a frame."""
+
+    form = "10-K"
+    filing_date = "2025-03-01"
+    period_of_report = "2025-01-31"
+    accession_no = "0000000000-25-000001"
+
+    class _Statement:
+        def to_dataframe(self):
+            raise ValueError("XBRL frame is missing a context")
+
+    income_statement = _Statement()
+    balance_sheet = None
+    cash_flow_statement = None
+
+    def obj(self):
+        return self
+
+    def full_text_submission(self):
+        return "<filing/>"
+
+
+def test_a_statement_that_fails_to_convert_is_parse_failed_not_absent():
+    """Exercises the real sec provider with edgartools stubbed out: a statement we
+    cannot read is our failure, not evidence that the filing never carried it."""
+    company = mock.MagicMock()
+    company.get_filings.return_value.__getitem__.return_value = _UnreadableFiling()
+    with _TempPlane():
+        with mock.patch("edgar.Company", return_value=company), \
+                mock.patch.object(sec, "_identity", return_value="me"):
+            result = pull("NVDA", sources=["sec"])
+        doc = _coverage(result)
+        assert contracts.validate_against(doc, "coverage") == []
+        rows = {r["dataset"]: r for r in doc["rows"]}
+        assert rows["income_annual_0"]["acquisition"] == "PARSE_FAILED", rows["income_annual_0"]
+        assert "missing a context" in rows["income_annual_0"]["label"], rows["income_annual_0"]
+        assert rows["balance_annual_0"]["acquisition"] == "MISSING", rows["balance_annual_0"]
+        print("  an unreadable statement is PARSE_FAILED, an absent one is MISSING ✓")
+
+
+def test_a_yahoo_dataset_failure_keeps_the_error_text():
+    """yfinance changing under us has to be legible in the coverage row."""
+
+    class _BrokenTicker:
+        def __getattr__(self, name):
+            def boom(*args, **kwargs):
+                raise RuntimeError("yfinance changed its column names")
+            return boom
+
+    with _TempPlane():
+        with mock.patch.dict(sys.modules, {"yfinance": mock.MagicMock(
+                Ticker=lambda ticker: _BrokenTicker())}):
+            result = pull("NVDA", sources=["yahoo"])
+        assert result["status"] == "FAILED", result
+        row = {r["dataset"]: r for r in _coverage(result)["rows"]}["yahoo_prices"]
+        assert row["acquisition"] == "FAILED", row
+        assert "yfinance changed its column names" in row["label"], row
+        print("  a failing Yahoo dataset names its error in the coverage row ✓")
+
+
+def test_a_bogus_ticker_records_gaps_and_publishes_no_snapshot():
     with _TempPlane():
         s, y, a = _Sec(fail=True), _Yahoo(fail=True), _Estimates(fail=True)
         with _patched(s, y, a):
             result = pull("ZZZZ")
-        assert result["status"] == "RETRIEVED", result
+        assert result["status"] == "FAILED", result
         doc = _coverage(result)
         assert contracts.validate_against(doc, "coverage") == []
         assert doc["rows"], "a failed run still records what it could not acquire"
@@ -215,8 +277,47 @@ def test_a_bogus_ticker_publishes_a_valid_coverage_document():
             assert row["acquisition"] in ("FAILED", "MISSING"), row
             assert row.get("reason"), row
         assert result["table_hashes"] == {}
+        assert result["open_gaps"], result
+        assert "snapshot_id" not in doc, "coverage must not name a snapshot that was never published"
         assert Path(result["coverage_path"]).is_file()
-        print("  a bogus ticker raises nothing and still writes valid coverage ✓")
+        assert store.snapshot_dirs("ZZZZ") == [], \
+            "a run holding no evidence must not publish a snapshot a later pull can hit"
+        print("  a bogus ticker records valid coverage and publishes no snapshot ✓")
+
+
+def test_a_failed_run_is_not_cached_and_the_scope_recovers():
+    """The cache has no TTL: a run that retrieved nothing must not read back CACHED."""
+    with _TempPlane():
+        s, y, a = _Sec(fail=True), _Yahoo(fail=True), _Estimates(fail=True)
+        with _patched(s, y, a):
+            failed = pull("NVDA")
+            asked = (s.calls, y.calls, a.calls)
+            again = pull("NVDA")
+        assert failed["status"] == "FAILED", failed
+        assert again["status"] == "FAILED", again
+        assert all(now > before for now, before in
+                   zip((s.calls, y.calls, a.calls), asked)), \
+            "a failed run must be re-attempted, not answered from the cache"
+        # once the providers answer, the same plain pull acquires without a refresh
+        with _patched(_Sec(), _Yahoo(), _Estimates()):
+            recovered = pull("NVDA")
+        assert recovered["status"] == "RETRIEVED", recovered
+        assert recovered["table_hashes"], recovered
+        print("  a fully failed run is never a cache hit ✓")
+
+
+def test_one_issuer_two_tickers_do_not_share_a_snapshot():
+    with _TempPlane():
+        s, y, a = _Sec(), _Yahoo(), _Estimates()
+        with _patched(s, y, a):
+            adr = pull("NSRGY", issuer="NESTLE", sources=["yahoo"])
+            line = pull("NESN.SW", issuer="NESTLE", sources=["yahoo"])
+        assert adr["status"] == "RETRIEVED" and line["status"] == "RETRIEVED", (adr, line)
+        assert adr["scope_key"] != line["scope_key"], "the ticker belongs in the scope"
+        assert line["snapshot_dir"] != adr["snapshot_dir"]
+        assert y.calls == 2, "a second listing is its own acquisition, not a cache hit"
+        assert manifest("NESTLE", run_id=Path(adr["snapshot_dir"]).name)["ticker"] == "NSRGY"
+        print("  one issuer's two tickers hold their own snapshots ✓")
 
 
 def test_refresh_adds_a_version_and_leaves_the_first_untouched():
@@ -276,6 +377,34 @@ def test_an_empty_transcript_is_missing_not_a_silent_success():
         print("  an empty transcript is MISSING, never a silent success ✓")
 
 
+def test_an_empty_source_set_is_refused_not_read_as_every_source():
+    try:
+        pull("NVDA", sources=[])
+    except ValueError as exc:
+        assert "at least one" in str(exc), exc
+    else:
+        raise AssertionError("an explicitly empty source set must not acquire everything")
+    print("  an empty source set is refused rather than read as every source ✓")
+
+
+def test_a_repeated_quarter_is_asked_for_once():
+    with _TempPlane():
+        with mock.patch.object(alphavantage, "config") as cfg:
+            cfg.get.return_value = "key"
+            with mock.patch.object(alphavantage.urllib.request, "urlopen",
+                                   _http({"symbol": "NVDA", "quarter": "2025Q1",
+                                          "transcript": [{"speaker": "Operator",
+                                                          "title": "Operator",
+                                                          "content": "Welcome."}]})) as provider:
+                with _patched(_Sec(), _Yahoo(), _Estimates()):
+                    result = pull("NVDA", sources=["alpha_vantage"],
+                                  transcripts=["2025Q1", "2025Q1"])
+        assert provider.call_count == 1, "a repeated quarter must not spend a second request"
+        rows = [r for r in _coverage(result)["rows"] if r["dataset"] == "av_transcript_2025Q1"]
+        assert len(rows) == 1, rows
+        print("  a repeated quarter is acquired once and recorded once ✓")
+
+
 def test_a_cached_quarter_is_reused_and_the_rest_is_acquired():
     segment = {"speaker": "Operator", "title": "Operator", "content": "Welcome."}
     with _TempPlane():
@@ -315,14 +444,32 @@ def test_a_cached_quarter_is_reused_and_the_rest_is_acquired():
         print("  a held quarter is reused with zero calls and carried into the new snapshot ✓")
 
 
+def test_the_cli_exits_non_zero_when_nothing_was_published():
+    with _TempPlane():
+        with _patched(_Sec(fail=True), _Yahoo(fail=True), _Estimates(fail=True)), \
+                mock.patch("sys.stdout", new_callable=io.StringIO):
+            assert main(["ZZZZ"]) == 1, "a run that acquired nothing must not exit 0"
+        with _patched(_Sec(), _Yahoo(), _Estimates()), \
+                mock.patch("sys.stdout", new_callable=io.StringIO):
+            assert main(["NVDA"]) == 0, "a published snapshot exits 0"
+    print("  the CLI exits non-zero when nothing was published ✓")
+
+
 if __name__ == "__main__":
     test_estimate_metadata_names_a_period_field_the_payload_carries()
     test_a_repeat_pull_is_cached_with_zero_provider_calls()
     test_each_source_set_publishes_its_own_snapshot()
     test_a_failing_provider_becomes_coverage_rows_not_an_exception()
-    test_a_bogus_ticker_publishes_a_valid_coverage_document()
+    test_a_statement_that_fails_to_convert_is_parse_failed_not_absent()
+    test_a_yahoo_dataset_failure_keeps_the_error_text()
+    test_a_bogus_ticker_records_gaps_and_publishes_no_snapshot()
+    test_a_failed_run_is_not_cached_and_the_scope_recovers()
+    test_one_issuer_two_tickers_do_not_share_a_snapshot()
+    test_an_empty_source_set_is_refused_not_read_as_every_source()
     test_refresh_adds_a_version_and_leaves_the_first_untouched()
     test_a_transcript_quarter_reports_the_providers_own_reason()
     test_an_empty_transcript_is_missing_not_a_silent_success()
+    test_a_repeated_quarter_is_asked_for_once()
     test_a_cached_quarter_is_reused_and_the_rest_is_acquired()
+    test_the_cli_exits_non_zero_when_nothing_was_published()
     print("all offline pull tests passed")

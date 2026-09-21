@@ -88,12 +88,16 @@ A `run-id` looks like `2026-09-21T145130+0000-fa3741`. A refresh adds a new one.
 - **Hash-checked reads.** Every table's sha256 is recorded in the manifest, and
   `read_table` refuses a file that no longer matches it.
 - **Honest partial failure.** A provider that fails degrades to `FAILED` coverage
-  rows with a reason; the datasets that succeeded are still published.
+  rows with a reason; the datasets that succeeded are still published. A run that
+  retrieved nothing at all publishes no snapshot — it records the same coverage
+  rows and reports `FAILED` — so a failed acquisition never reads back as `CACHED`.
+  The CLI exits non-zero for a run that published nothing, so a scheduled pull cannot
+  report success while the store is unchanged.
 - **Cache-first, per source set.** `pull("NVDA")` twice makes one network run.
-  The cache key is the issuer plus the source set plus the transcript quarters,
-  and it contains no date — so the cache never expires on its own. Freshness is
-  the explicit `refresh=True`. Because the key is per source set, a daily Yahoo
-  refresh does not re-pull 11 SEC filings.
+  The cache key is the issuer, the ticker, the source set and the transcript
+  quarters, and it contains no date — so the cache never expires on its own.
+  Freshness is the explicit `refresh=True`. Because the key is per source set, a
+  daily Yahoo refresh does not re-pull 11 SEC filings.
 - **`cache_only=True` never touches the network**, and returns
   `{"status": "MISSING: NOT_RETRIEVED"}` when nothing is held for that scope.
 
@@ -103,7 +107,9 @@ Alpha Vantage is a source for earnings estimates and transcripts and nothing
 else — it is never a price source and never a fallback for Yahoo. The free tier is
 tightly limited, so a plain `pull(ticker)` costs exactly one request, transcripts
 are opt-in, and `--ceiling` caps a run (requests are counted and returned either
-way).
+way). Transcript calls are counted under their own `alpha_vantage_transcripts` key,
+so `--ceiling alpha_vantage=10,alpha_vantage_transcripts=2` caps the two
+independently.
 
 Yahoo is unofficial: yfinance changes under you, and a failure there shows up as
 `FAILED` coverage rows with everything else still succeeding. A failing Yahoo does

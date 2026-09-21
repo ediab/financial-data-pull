@@ -9,6 +9,11 @@ import sys
 
 from .pull import SOURCES, pull
 
+# A run that published nothing must not exit 0: a scheduled pull would report success
+# while the store is unchanged. `MISSING: NOT_RETRIEVED` is an answer, not a failure —
+# `--cache-only` asked what is held and got a truthful "nothing".
+UNPUBLISHED_STATUSES = ("FAILED", "CONTRACT_VIOLATION")
+
 
 def _ceiling(text: str) -> dict[str, int]:
     """`provider=n` pairs, e.g. alpha_vantage=10,sec=40."""
@@ -34,7 +39,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--refresh", action="store_true", help="add a new snapshot version")
     p.add_argument("--cache-only", action="store_true", help="zero network requests")
     p.add_argument("--ceiling", default=None,
-                   help="per-provider request limits, for example alpha_vantage=10,sec=40")
+                   help="per-provider request limits, for example alpha_vantage=10,sec=40; "
+                        "transcripts count under their own alpha_vantage_transcripts key")
     args = p.parse_args(argv)
 
     try:
@@ -49,7 +55,7 @@ def main(argv: list[str] | None = None) -> int:
         print(exc, file=sys.stderr)
         return 1
     print(json.dumps(result, indent=2, default=str))
-    return 0
+    return 1 if result.get("status") in UNPUBLISHED_STATUSES else 0
 
 
 if __name__ == "__main__":

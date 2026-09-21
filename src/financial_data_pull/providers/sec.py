@@ -36,8 +36,11 @@ def statements(ticker: str, form: str, index: int = 0, issuer: str | None = None
 
     Returns ({"income"|"balance"|"cashflow": frame}, meta). A statement the filing
     genuinely does not carry is simply absent from the mapping — the caller
-    records that as MISSING, it is not an error. When `issuer` is given the
-    filing's full-text submission is preserved as an immutable original.
+    records that as MISSING, it is not an error. A statement that exists but cannot
+    be converted is named in `meta["statements_unreadable"]` with its redacted
+    reason, so the caller records a parse failure instead of blaming the filing.
+    When `issuer` is given the filing's full-text submission is preserved as an
+    immutable original.
     """
     from edgar import Company
     _identity()
@@ -47,21 +50,25 @@ def statements(ticker: str, form: str, index: int = 0, issuer: str | None = None
     f = c.get_filings(form=form)[index]
     report = f.obj()
     frames: dict[str, pd.DataFrame] = {}
-    missing: list[str] = []
+    absent: list[str] = []
+    unreadable: dict[str, str] = {}
     for kind, attr in STATEMENT_KINDS.items():
         statement = getattr(report, attr, None)
         if statement is None:
-            missing.append(kind)
+            absent.append(kind)
             continue
         try:
             frames[kind] = statement.to_dataframe()
-        except Exception:  # noqa: BLE001 — an unreadable statement is absent, not fatal
-            missing.append(kind)
+        except Exception as e:  # noqa: BLE001 — one unreadable statement, not a failed filing
+            # the reason travels in the filing's meta so the caller can record a parse
+            # failure instead of claiming the filing does not carry the statement
+            unreadable[kind] = store.clean_error(e)
     meta = {
         "ticker": ticker, "form": str(f.form), "filing_date": str(f.filing_date),
         "period_of_report": str(getattr(f, "period_of_report", None)),
         "accession": str(getattr(f, "accession_no", None)),
-        "statements": sorted(frames), "statements_absent": sorted(missing),
+        "statements": sorted(frames), "statements_absent": sorted(absent),
+        "statements_unreadable": unreadable,
         "retrieved_at": store.now_iso(),
         "as_of": str(getattr(f, "period_of_report", None)),
     }

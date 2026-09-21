@@ -9,9 +9,9 @@ material, acquired into the benchmark snapshot with its provider, analyst count
 and as-of attribution. An estimate never fills a reported historical slot.
 
 Every RETRIEVED dataset gets a table and a preserved payload; a dataset that is
-absent or fails gets an explicit reason rather than a bare status. yfinance
-exposes no raw response accessor, so the preserved payload is the normalized
-frame and the manifest says so.
+absent or fails gets an explicit reason, and a failure also names the error, rather
+than a bare status. yfinance exposes no raw response accessor, so the preserved
+payload is the normalized frame and the manifest says so.
 """
 from __future__ import annotations
 
@@ -34,7 +34,8 @@ _PAYLOAD_KIND = "normalized_frame (yfinance exposes no raw response accessor)"
 
 
 def _meta(ticker: str, statuses: dict, reasons: dict, originals: dict,
-          frames: dict | None = None, detail: str | None = None) -> dict:
+          frames: dict | None = None, detail: str | None = None,
+          failures: dict | None = None) -> dict:
     meta = {
         "ticker": ticker,
         "provider": "yahoo",
@@ -55,6 +56,10 @@ def _meta(ticker: str, statuses: dict, reasons: dict, originals: dict,
         meta["price_as_of"] = str(prices.index[-1])[:10]
     if detail:
         meta["detail"] = detail
+    if failures:
+        # per-dataset error text, so a FAILED row says what broke and not just that
+        # something did
+        meta["failures"] = failures
     return meta
 
 
@@ -66,12 +71,14 @@ def fetch(ticker: str, issuer: str | None = None, ceiling=None) -> tuple[dict, d
     statuses: dict[str, str] = {}
     reasons: dict[str, str] = {}
     originals: dict[str, str] = {}
+    failures: dict[str, str] = {}
     try:
         t = Ticker(ticker)
     except Exception as e:  # noqa: BLE001 — constructor failure must not abort the snapshot
         statuses = {name: "FAILED" for name in DATASETS}
         reasons = {name: "NOT_RETRIEVABLE" for name in DATASETS}
-        return frames, _meta(ticker, statuses, reasons, originals, detail=type(e).__name__)
+        return frames, _meta(ticker, statuses, reasons, originals,
+                             detail=store.clean_error(e))
 
     def grab(name, fn):
         try:
@@ -103,8 +110,9 @@ def fetch(ticker: str, issuer: str | None = None, ceiling=None) -> tuple[dict, d
                 originals[name] = str(store.save_raw(issuer, "yahoo", payload, suffix=".json"))
         except PermissionError:
             raise  # approved request ceiling breached — never swallowed
-        except Exception:  # noqa: BLE001 — partial failure must not erase the rest
+        except Exception as e:  # noqa: BLE001 — partial failure must not erase the rest
             statuses[name], reasons[name] = "FAILED", "NOT_RETRIEVABLE"
+            failures[name] = store.clean_error(e)
 
     grab("yahoo_prices", lambda: t.history(period="1y", interval="1d"))
     grab("yahoo_earnings_estimate", lambda: t.earnings_estimate)
@@ -115,4 +123,5 @@ def fetch(ticker: str, issuer: str | None = None, ceiling=None) -> tuple[dict, d
     grab("yahoo_recommendations", lambda: t.recommendations)
     grab("yahoo_upgrades_downgrades", lambda: t.upgrades_downgrades)
 
-    return frames, _meta(ticker, statuses, reasons, originals, frames=frames)
+    return frames, _meta(ticker, statuses, reasons, originals, frames=frames,
+                         failures=failures)
