@@ -255,11 +255,25 @@ reusable. Read that file first (698 lines).
   `DEFAULT_SOURCES = SOURCES`.
 - `_clean_error`, `_period_labels`, `_row`, `_statements_from_sec`
   (all verbatim — `_statements_from_sec` takes `ceiling`, which still exists)
-- `_transcript_row`, `held_transcript_quarters`, `_held_transcript_segments`
+- `_transcript_row` and `_held_transcript_segments` verbatim.
+- `held_transcript_quarters` with one adaptation: its body calls
+  `store.snapshot_dirs(issuer, kind=TRANSCRIPT_KIND)`, and the `kind` parameter
+  no longer exists (Unit 2 removes it). Walk all snapshots
+  (`store.snapshot_dirs(issuer)`) and, per coverage row, additionally require
+  `row["dataset"].startswith("av_transcript_")` before recording the quarter.
 - The list comprehensions that build the `provider_meta`/coverage rows for Yahoo
   and Alpha Vantage inside upstream's `_benchmark_run`
 - The body of upstream's `transcripts()` acquisition loop (from `spacing = ...`
-  through `tables = {...}`), minus every `approvals.*` call
+  through `tables = {...}`), minus every `approvals.*` call. That region alone
+  does not compile — it references names defined earlier in `transcripts()`.
+  Define them in `pull()` before the loop:
+  `wanted = [q for q in (transcripts or []) if q]`,
+  `held = {} if refresh else held_transcript_quarters(issuer)`,
+  `live_calls = 0`, `segments: list[dict] = []`, `missing: list[str] = []`.
+  Drop upstream's all-quarters-cached early return and its PROPOSAL branches —
+  the whole-snapshot scope key (4c) already returns CACHED for a fully-held,
+  previously-pulled scope, and a new scope that happens to reuse held quarters
+  should still publish its own snapshot (with zero live calls).
 - The whole of upstream's `_publish_snapshot`, minus the `case`, `plan` and
   `kind` parameters, and minus its `approvals.set_pin` / `approvals.update_run`
   blocks
@@ -324,12 +338,17 @@ Behaviour, in order:
 
 1. `sources = list(sources or DEFAULT_SOURCES)`; raise `ValueError` for any
    source not in `SOURCES`. Raise `ValueError` if `cache_only and refresh`.
+   Raise `ValueError` if `transcripts` is passed without `"alpha_vantage" in
+   sources` — transcripts are an Alpha Vantage endpoint and cannot be pulled
+   from the other sources.
 2. `issuer = issuer or ticker`; `store.safe_component(issuer, "issuer")`.
 3. `key = scope_key(issuer, sources, transcripts)`.
-4. **cache_only:** return the matching snapshot's manifest with
+4. **cache_only:** return the newest matching snapshot's manifest with
    `{"status": "CACHED", "cache_only": True, ...}`, or
-   `{"status": "MISSING: NOT_RETRIEVED", "issuer": issuer}` if none. Never
-   touches the network.
+   `{"status": "MISSING: NOT_RETRIEVED", "issuer": issuer}` if none. Newest =
+   last in `snapshot_dirs` sort order, the same tie-break
+   `latest_snapshot_dir` uses; repeated refreshes can leave several snapshots
+   sharing one scope key. Never touches the network.
 5. **not refresh:** run `_cache_lookup`; if it hits, return
    `{**hit, "status": "CACHED"}` with zero network calls.
 
@@ -350,7 +369,13 @@ Behaviour, in order:
    `retrieved_at = store.now_iso()`.
 7. Acquire each requested source, **each wrapped so one provider's failure
    becomes coverage rows rather than an exception**, and with `PermissionError`
-   re-raised (a ceiling breach is not a data problem). Acquire in this order so
+   re-raised (a ceiling breach is not a data problem) — **except** in the
+   transcript loop, which keeps upstream's behaviour: a `PermissionError` from
+   `earnings_call_transcript` is recorded as a `MISSING` coverage row for that
+   quarter and the loop continues, so one capped or throttled quarter cannot
+   discard the rest. A ceiling on `alpha_vantage_transcripts` therefore
+   surfaces as MISSING rows, never an exception; `sec`, `yahoo` and
+   `alpha_vantage` (estimates) breaches do raise. Acquire in this order so
    the partial-failure contract is easiest to reason about: `sec`, then `yahoo`,
    then `alpha_vantage`, then transcripts. Record every dataset's status in
    `rows`, its frame in `tables`, its metadata in `provider_meta`, and any
@@ -379,8 +404,6 @@ def read_table(ticker, table, *, issuer=None, run_id=None)
 
 These two are the read half of "pull and cache" (owner requirement
 2026-09-21: keep both).
-them and nothing else changes — but then the cache is only reachable by reading
-Parquet files by hand.
 
 ### 4e. `_publish_snapshot` manifest changes
 
@@ -439,8 +462,9 @@ starts with
 `sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))`.
 
 1. **`tests/test_store.py`** — copy the `_TempPlane` pattern from
-   `UPSTREAM/tests/test_g0_and_store.py` (lines 23-40), **minus**
-   `approvals.ASSIGNMENTS` (that module does not exist here). Cover:
+   `UPSTREAM/tests/test_g0_and_store.py` (lines 23-40), **minus** the
+   `approvals.ASSIGNMENTS` and `store.DOCUMENTS` patches (neither exists here:
+   the approvals module is gone and Unit 2 deletes `DOCUMENTS`). Cover:
    - a `.staging-*` directory is invisible to `snapshot_dirs()` and to
      `latest_snapshot_dir()`
    - `commit_snapshot` refuses when `snapshot.json` is absent, and refuses a
@@ -470,7 +494,9 @@ starts with
      `MISSING`, never a silent success
 3. **`tests/test_ceiling.py`** — a named ceiling raises `PermissionError` on the
    call that exceeds it; an unnamed provider is counted in `requests` and is not
-   capped; `Ceiling` is truthy.
+   capped; `Ceiling` is truthy. Scope the raise test to `sec`, `yahoo` and
+   `alpha_vantage` — a transcript ceiling breach is recorded as `MISSING` rows,
+   not raised (see Unit 4 step 7).
 
 `tests/run_all.sh` — copy `UPSTREAM/tests/run_all.sh` structure, reduced to the
 three files above, `set -euo pipefail`, `PY="${PY:-.venv/bin/python}"`, no
@@ -491,7 +517,8 @@ spends real API quota and takes minutes.
 .venv/bin/python -m financial_data_pull.cli NVDA --sources alpha_vantage
 ```
 
-Expected: 9 tables in the first snapshot, 33 in the second, 1 in the third.
+Expected: 8 tables in the first snapshot (`len(yahoo.DATASETS)`), 33 in the
+second, 1 in the third.
 Then re-run each with no flags and confirm `status` is `CACHED`.
 
 ---
@@ -501,7 +528,7 @@ Then re-run each with no flags and confirm `status` is `CACHED`.
 | Check | Command | Pass condition |
 |---|---|---|
 | Install | `.venv/bin/pip install -e .` | exit 0 |
-| Import surface | `python -c "import financial_data_pull"` | prints `0.1.0`, no pandas import |
+| Import surface | `python -c "import financial_data_pull; print(financial_data_pull.__version__)"` | prints `0.1.0`; pandas loads too (eager import, see Unit 1) |
 | Store integrity | `python tests/test_store.py` | exit 0 |
 | Pull behaviour | `python tests/test_pull_offline.py` | exit 0 |
 | Ceiling | `python tests/test_ceiling.py` | exit 0 |
@@ -541,7 +568,7 @@ Also confirm `git status`-equivalence by inspection: no `data/`, `.env`, or
    `EARNINGS_CALL_TRANSCRIPT` — and nothing else. Spending AV quota to paper over
    a Yahoo failure is explicitly out of scope.
 3. **A full `pull(ticker)` is slow.** 11 EDGAR filings, 11 full-text submissions,
-   9 Yahoo datasets, 1 AV request — minutes, not seconds. Tests must never do
+   8 Yahoo datasets, 1 AV request — minutes, not seconds. Tests must never do
    this; only Unit 6 does, deliberately.
 4. **`EDGAR_IDENTITY` is mandatory for SEC.** `sec._identity()` raises
    `RuntimeError` without it. The copied `.env` supplies it.
