@@ -6,8 +6,9 @@ memo and workbook work belongs in the consuming project.
 
 ## Read first
 
-- `README.md` — what the library pulls, where the data lands, and the guarantees
-  the store provides.
+- `README.md` — what the library pulls (including the last four call transcripts a
+  plain pull acquires by default), where the data lands, and the guarantees the store
+  provides.
 - `tests/run_all.sh` — four offline suites that pin those guarantees; read the
   suite covering the path you are about to change.
 
@@ -31,7 +32,9 @@ memo and workbook work belongs in the consuming project.
   when truthy, so a pull asking for no 8-Ks hashes exactly as it did before the
   parameter existed and still answers from the snapshots already held. A golden test
   pins that hash; changing the serialization orphans every held snapshot, which
-  becomes a permanent cache miss and a re-download.
+  becomes a permanent cache miss and a re-download. (It is the *derived transcript
+  quarters* a plain pull now carries that move the default scope, once a quarter —
+  see the transcripts gotcha.)
 - **`data/csv/` is derived, never evidence.** `export_csv` takes each table from the
   newest snapshot that carries it, through the same hash check as `read_table`; a
   recorded parquet that has vanished refuses the export rather than falling back to
@@ -52,18 +55,35 @@ memo and workbook work belongs in the consuming project.
   with.
 - **Pins are load-bearing.** Dependency versions move deliberately, with the
   Parquet round-trip and the parsed press release in mind.
+- **Logging is finish-only, on stderr.** The library logs but never configures a
+  handler, so an importable use is silent; the CLI installs one and prints one INFO
+  line per dataset plus one human run status (`CACHED — evidence already held, zero
+  network (snapshot <run-id>)`, `NEW SNAPSHOT <run-id> — N requests spent`, nothing
+  held, or `FAILED — nothing published`). Degraded datasets get a WARNING naming their
+  reason. `--quiet` drops the handler to WARNING and silences the status line; stdout
+  stays the JSON result alone.
 
 ## Gotchas
 
 - `from financial_data_pull import pull` binds the **function** (the package
   re-exports it). Import from `financial_data_pull.pull` to reach `SOURCES`,
   `Ceiling`, `scope_key`, or the module itself.
-- Transcripts need `alpha_vantage` among `sources`, and such a run re-acquires the
-  estimates too: a source set is acquired whole, so adding transcript quarters
-  makes a new scope and a new snapshot.
+- **Transcripts are in the default pull and need `alpha_vantage` among `sources`.**
+  `transcripts=None` derives the last 4 completed calendar quarters from today
+  (`pull.last_completed_quarters`), but only when `alpha_vantage` is in the source
+  set — a restricted default pull such as `sources=["sec"]` stays transcript-free
+  rather than raising. `transcripts=[]` / `--transcripts none` opts out; an explicit
+  `YYYYQN` list overrides. Because the derived labels change every calendar quarter, a
+  plain pull's scope moves quarterly: the first plain pull after a rollover
+  re-acquires the whole source set (SEC ~22 requests, ~98 MB of originals, Yahoo,
+  estimates, one new transcript) — not just the new quarter. A quarter already held
+  costs 0.
 - 8-Ks need `sec` among `sources`, and `eight_ks` is part of the scope, so adding
   (or changing) it is a fresh acquisition of the whole source set — not just the
   filings, and not a cache hit for the 8-Ks alone.
+- A quarter that just ended may not be on Alpha Vantage yet: it is recorded
+  `MISSING`, and because the scope then caches, later plain pulls keep missing it.
+  Pass `--refresh` (or the explicit quarter label once it is posted) to retry.
 - A live pull spends real quota and minutes — `sec` is 22 requests for 11 filings,
   Alpha Vantage's free tier is tightly limited, and preserved originals run to
   ~98 MB per ticker. Tests never run one.

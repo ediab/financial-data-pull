@@ -12,8 +12,10 @@ from __future__ import annotations
 import io
 import itertools
 import json
+import logging
 import sys
 from contextlib import ExitStack
+from datetime import date, datetime, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -25,7 +27,9 @@ import pandas as pd
 from financial_data_pull import contracts, store
 from financial_data_pull.cli import main
 from financial_data_pull.providers import alphavantage, sec, yahoo
-from financial_data_pull.pull import export_csv, manifest, pull, read_table, scope_key
+from financial_data_pull.pull import (QUARTER_LABEL, export_csv, last_completed_quarters,
+                                      manifest, pull, read_table, scope_key)
+from financial_data_pull.pull import logger as pull_logger
 
 from test_store import _TempPlane
 
@@ -167,13 +171,53 @@ def _ageing_clock():
     return mock.Mock(side_effect=lambda: f"2026-09-21T14:{next(ticks):02d}:00+0000")
 
 
-def _patched(s, y, a, e=None) -> ExitStack:
-    """All four providers doubled: no test in this file can reach the network."""
+class _Transcripts:
+    """Earnings-call transcripts as Alpha Vantage serves them: one segment per quarter."""
+
+    def __init__(self, fail: bool = False):
+        self.calls = 0
+        self.quarters: list[str] = []
+        self.fail = fail
+
+    def __call__(self, symbol, quarter, issuer=None, ceiling=None):
+        self.calls += 1
+        self.quarters.append(quarter)
+        if self.fail:
+            return None, {"provider": "alpha_vantage", "dataset": "av_transcript",
+                          "quarter": quarter, "status": "FAILED",
+                          "reason": "NOT_RETRIEVABLE", "detail": "transcripts unavailable"}
+        if ceiling:
+            ceiling.spend("alpha_vantage_transcripts")
+        data = {"symbol": symbol, "quarter": quarter,
+                "segments": [{"speaker": "Operator", "title": "Operator",
+                              "content": "Welcome to the call."}]}
+        meta = {"provider": "alpha_vantage", "dataset": "av_transcript",
+                "quarter": quarter, "status": "RETRIEVED", "reason": None,
+                "segments": 1, "retrieved_at": store.now_iso(), "original_path": None}
+        if issuer:
+            meta["original_path"] = str(store.save_raw(
+                issuer, "alpha_vantage", json.dumps(data).encode(), suffix=".json"))
+        return data, meta
+
+
+_real_transcript = alphavantage.earnings_call_transcript
+
+
+def _patched(s, y, a, e=None, transcripts=None) -> ExitStack:
+    """All providers doubled: no test in this file can reach the network.
+
+    The earnings-call transcript provider is doubled too — a plain pull now derives
+    the last four quarters, so a real call would spend quota. The few tests that
+    exercise the real provider through a patched `urlopen` pass
+    `transcripts=_real_transcript`.
+    """
     stack = ExitStack()
     stack.enter_context(mock.patch.object(sec, "statements", s))
     stack.enter_context(mock.patch.object(yahoo, "fetch", y))
     stack.enter_context(mock.patch.object(alphavantage, "earnings_estimates", a))
     stack.enter_context(mock.patch.object(sec, "earnings_8k", e or _EightK()))
+    stack.enter_context(mock.patch.object(alphavantage, "earnings_call_transcript",
+                                          transcripts or _Transcripts()))
     return stack
 
 
@@ -185,6 +229,33 @@ def _tree(root: Path) -> dict[str, str]:
     """Every file of a snapshot with its hash — the whole published version."""
     return {str(p.relative_to(root)): store.sha256_file(p)
             for p in sorted(root.rglob("*")) if p.is_file()}
+
+
+class _LogCapture(logging.Handler):
+    """Collect the library logger's records without touching the root configuration.
+
+    The library adds no output handler, so a test reads the records at the logger it
+    emits from (the same seam a caller configuring logging would use) rather than
+    relying on a global handler that a passing suite would otherwise have to clean up.
+    """
+
+    def __init__(self, logger: logging.Logger):
+        super().__init__(level=logging.NOTSET)
+        self.records: list[logging.LogRecord] = []
+        self._logger = logger
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.records.append(record)
+
+    def __enter__(self) -> "_LogCapture":
+        self._logger.addHandler(self)
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self._logger.removeHandler(self)
+
+    def messages(self, level: int) -> list[str]:
+        return [r.getMessage() for r in self.records if r.levelno == level]
 
 
 def test_estimate_metadata_names_a_period_field_the_payload_carries():
@@ -204,17 +275,70 @@ def test_estimate_metadata_names_a_period_field_the_payload_carries():
     print("  estimate metadata names a period field the payload carries ✓")
 
 
+def test_last_completed_quarters_follows_the_calendar():
+    """The derived default: the quarter has to have *ended* to be asked for."""
+    # mid-quarter dates: the current quarter is not completed
+    assert last_completed_quarters(date(2026, 5, 10)) == \
+        ["2025Q2", "2025Q3", "2025Q4", "2026Q1"]
+    assert last_completed_quarters(date(2026, 2, 15)) == \
+        ["2025Q1", "2025Q2", "2025Q3", "2025Q4"]
+    assert last_completed_quarters(date(2026, 8, 7)) == \
+        ["2025Q3", "2025Q4", "2026Q1", "2026Q2"]
+    # first day of a quarter: the one that just ended counts as completed
+    assert last_completed_quarters(date(2026, 1, 1)) == \
+        ["2025Q1", "2025Q2", "2025Q3", "2025Q4"]
+    assert last_completed_quarters(date(2026, 4, 1)) == \
+        ["2025Q2", "2025Q3", "2025Q4", "2026Q1"]
+    # the last day of a quarter: that quarter has not ended yet
+    assert last_completed_quarters(date(2026, 3, 31)) == \
+        ["2025Q1", "2025Q2", "2025Q3", "2025Q4"]
+    print("  the last four completed quarters follow the calendar ✓")
+
+
+def test_a_default_pull_derives_the_last_four_completed_quarters():
+    with _TempPlane():
+        t = _Transcripts()
+        with _patched(_Sec(), _Yahoo(), _Estimates(), transcripts=t):
+            result = pull("NVDA")
+        expected = last_completed_quarters(datetime.now(timezone.utc).date())
+        assert result["status"] == "RETRIEVED", result
+        assert t.quarters == expected, (t.quarters, expected)
+        rows = [r for r in _coverage(result)["rows"]
+                if str(r["dataset"]).startswith("av_transcript_")]
+        assert sorted(r["period"] for r in rows) == sorted(expected), rows
+        assert "av_transcript" in result["table_hashes"], result["table_hashes"]
+        # an explicit empty list opts out, and its scope is not the derived one
+        assert result["scope_key"] != scope_key("NVDA", "NVDA",
+                                                ["sec", "alpha_vantage", "yahoo"], [])
+        print("  a plain pull derives the last four completed quarters ✓")
+
+
+def test_a_restricted_default_pull_stays_transcript_free_and_does_not_raise():
+    with _TempPlane():
+        with _patched(_Sec(), _Yahoo(), _Estimates()):
+            result = pull("NVDA", sources=["sec"])
+        assert result["status"] == "RETRIEVED", result
+        assert not any(str(r["dataset"]).startswith("av_transcript_")
+                       for r in _coverage(result)["rows"])
+        assert "av_transcript" not in result["table_hashes"]
+        assert result["requests"] == {"sec": 2}, result["requests"]
+        print("  a restricted default pull is transcript-free and does not raise ✓")
+
+
 def test_a_repeat_pull_is_cached_with_zero_provider_calls():
     with _TempPlane():
         s, y, a = _Sec(), _Yahoo(), _Estimates()
-        with _patched(s, y, a):
+        t = _Transcripts()
+        with _patched(s, y, a, transcripts=t):
             first = pull("NVDA")
-            asked = (s.calls, y.calls, a.calls)
+            asked = (s.calls, y.calls, a.calls, t.calls)
             second = pull("NVDA")
         assert first["status"] == "RETRIEVED", first
-        assert first["requests"] == {"sec": 2, "yahoo": 8, "alpha_vantage": 1}, first["requests"]
+        assert first["requests"] == {"sec": 2, "yahoo": 8, "alpha_vantage": 1,
+                                     "alpha_vantage_transcripts": 4}, first["requests"]
         assert second["status"] == "CACHED", second
-        assert (s.calls, y.calls, a.calls) == asked, "a cached pull must ask no provider"
+        assert (s.calls, y.calls, a.calls, t.calls) == asked, \
+            "a cached pull must ask no provider"
         assert len(store.snapshot_dirs("NVDA")) == 1
         assert len(list((store.COVERAGE / "NVDA").glob("*.json"))) == 1
         cached_only = pull("NVDA", cache_only=True)
@@ -410,7 +534,7 @@ def test_an_alpha_vantage_message_is_redacted_before_it_reaches_an_artifact():
 def test_a_bogus_ticker_records_gaps_and_publishes_no_snapshot():
     with _TempPlane():
         s, y, a = _Sec(fail=True), _Yahoo(fail=True), _Estimates(fail=True)
-        with _patched(s, y, a):
+        with _patched(s, y, a, transcripts=_Transcripts(fail=True)):
             result = pull("ZZZZ")
         assert result["status"] == "FAILED", result
         doc = _coverage(result)
@@ -432,7 +556,7 @@ def test_a_failed_run_is_not_cached_and_the_scope_recovers():
     """The cache has no TTL: a run that retrieved nothing must not read back CACHED."""
     with _TempPlane():
         s, y, a = _Sec(fail=True), _Yahoo(fail=True), _Estimates(fail=True)
-        with _patched(s, y, a):
+        with _patched(s, y, a, transcripts=_Transcripts(fail=True)):
             failed = pull("NVDA")
             asked = (s.calls, y.calls, a.calls)
             again = pull("NVDA")
@@ -490,7 +614,8 @@ def test_a_transcript_quarter_reports_the_providers_own_reason():
             cfg.get.return_value = "key"
             with mock.patch.object(alphavantage.urllib.request, "urlopen",
                                    _http({"Information": "premium endpoint"})):
-                with _patched(_Sec(), _Yahoo(), _Estimates()):
+                with _patched(_Sec(), _Yahoo(), _Estimates(),
+                              transcripts=_real_transcript):
                     result = pull("NVDA", sources=["alpha_vantage"],
                                        transcripts=["2025Q1"])
         doc = _coverage(result)
@@ -509,7 +634,8 @@ def test_an_empty_transcript_is_missing_not_a_silent_success():
             with mock.patch.object(alphavantage.urllib.request, "urlopen",
                                    _http({"symbol": "NVDA", "quarter": "2025Q1",
                                           "transcript": []})):
-                with _patched(_Sec(), _Yahoo(), _Estimates()):
+                with _patched(_Sec(), _Yahoo(), _Estimates(),
+                              transcripts=_real_transcript):
                     result = pull("NVDA", sources=["alpha_vantage"],
                                        transcripts=["2025Q1"])
         row = next(r for r in _coverage(result)["rows"]
@@ -539,7 +665,8 @@ def test_a_repeated_quarter_is_asked_for_once():
                                           "transcript": [{"speaker": "Operator",
                                                           "title": "Operator",
                                                           "content": "Welcome."}]})) as provider:
-                with _patched(_Sec(), _Yahoo(), _Estimates()):
+                with _patched(_Sec(), _Yahoo(), _Estimates(),
+                              transcripts=_real_transcript):
                     result = pull("NVDA", sources=["alpha_vantage"],
                                   transcripts=["2025Q1", "2025Q1"])
         assert provider.call_count == 1, "a repeated quarter must not spend a second request"
@@ -556,7 +683,8 @@ def test_a_cached_quarter_is_reused_and_the_rest_is_acquired():
             with mock.patch.object(alphavantage.urllib.request, "urlopen",
                                    _http({"symbol": "NVDA", "quarter": "2025Q1",
                                           "transcript": [segment]})):
-                with _patched(_Sec(), _Yahoo(), _Estimates()):
+                with _patched(_Sec(), _Yahoo(), _Estimates(),
+                              transcripts=_real_transcript):
                     first = pull("NVDA", sources=["alpha_vantage"],
                                       transcripts=["2025Q1"])
             assert "av_transcript" in first["table_hashes"], first["table_hashes"]
@@ -564,7 +692,8 @@ def test_a_cached_quarter_is_reused_and_the_rest_is_acquired():
             with mock.patch.object(alphavantage.urllib.request, "urlopen",
                                    _http({"symbol": "NVDA", "quarter": "2025Q2",
                                           "transcript": [segment]})) as provider:
-                with _patched(_Sec(), _Yahoo(), _Estimates()):
+                with _patched(_Sec(), _Yahoo(), _Estimates(),
+                              transcripts=_real_transcript):
                     second = pull("NVDA", sources=["alpha_vantage"],
                                        transcripts=["2025Q1", "2025Q2"])
         assert second["status"] == "RETRIEVED", second
@@ -589,13 +718,102 @@ def test_a_cached_quarter_is_reused_and_the_rest_is_acquired():
 
 def test_the_cli_exits_non_zero_when_nothing_was_published():
     with _TempPlane():
-        with _patched(_Sec(fail=True), _Yahoo(fail=True), _Estimates(fail=True)), \
-                mock.patch("sys.stdout", new_callable=io.StringIO):
+        err = io.StringIO()
+        with _patched(_Sec(fail=True), _Yahoo(fail=True), _Estimates(fail=True),
+                      transcripts=_Transcripts(fail=True)), \
+                mock.patch("sys.stdout", new_callable=io.StringIO), mock.patch("sys.stderr", err):
             assert main(["ZZZZ"]) == 1, "a run that acquired nothing must not exit 0"
+        assert "FAILED — nothing published" in err.getvalue().splitlines(), err.getvalue()
         with _patched(_Sec(), _Yahoo(), _Estimates()), \
-                mock.patch("sys.stdout", new_callable=io.StringIO):
+                mock.patch("sys.stdout", new_callable=io.StringIO), \
+                mock.patch("sys.stderr", new_callable=io.StringIO):
             assert main(["NVDA"]) == 0, "a published snapshot exits 0"
     print("  the CLI exits non-zero when nothing was published ✓")
+
+
+def test_the_cli_prints_the_run_status_to_stderr():
+    """One human line says cached or new; stdout keeps carrying only the JSON."""
+    with _TempPlane():
+        out, err = io.StringIO(), io.StringIO()
+        with _patched(_Sec(), _Yahoo(), _Estimates(), transcripts=_Transcripts()), \
+                mock.patch("sys.stdout", out), mock.patch("sys.stderr", err):
+            assert main(["NVDA"]) == 0, "the first run publishes"
+        result = json.loads(out.getvalue())
+        run_id = Path(result["snapshot_dir"]).name
+        spent = sum(result["requests"].values())
+        assert f"NEW SNAPSHOT {run_id} — {spent} requests spent" in err.getvalue().splitlines(), \
+            err.getvalue()
+        # the status line is a stderr aside: stdout still parses as the same JSON
+        assert result["status"] == "RETRIEVED"
+
+        out, err = io.StringIO(), io.StringIO()
+        with _patched(_Sec(fail=True), _Yahoo(fail=True), _Estimates(fail=True),
+                      transcripts=_Transcripts(fail=True)), \
+                mock.patch("sys.stdout", out), mock.patch("sys.stderr", err):
+            assert main(["NVDA"]) == 0, "the held scope is a cache hit"
+        assert f"CACHED — evidence already held, zero network (snapshot {run_id})" \
+            in err.getvalue().splitlines(), err.getvalue()
+        assert json.loads(out.getvalue())["status"] == "CACHED"
+
+        # a cache-only miss names what is held — nothing — rather than an empty answer
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch("sys.stdout", out), mock.patch("sys.stderr", err):
+            assert main(["ZZZZ", "--cache-only"]) == 0
+        assert "no data held for ZZZZ (cache-only)" in err.getvalue().splitlines(), err.getvalue()
+        assert json.loads(out.getvalue())["status"] == "MISSING: NOT_RETRIEVED"
+
+        # --quiet silences the status line and the INFO progress lines, and leaves
+        # stdout alone; the non-quiet run still logs its progress
+        out, err = io.StringIO(), io.StringIO()
+        with _patched(_Sec(fail=True), _Yahoo(fail=True), _Estimates(fail=True),
+                      transcripts=_Transcripts(fail=True)), \
+                _LogCapture(pull_logger) as log, \
+                mock.patch("sys.stdout", out), mock.patch("sys.stderr", err):
+            assert main(["NVDA", "--quiet"]) == 0
+        assert err.getvalue() == "", err.getvalue()
+        assert json.loads(out.getvalue())["status"] == "CACHED"
+        assert log.messages(logging.INFO) == [], log.messages(logging.INFO)
+        out, err = io.StringIO(), io.StringIO()
+        with _patched(_Sec(fail=True), _Yahoo(fail=True), _Estimates(fail=True),
+                      transcripts=_Transcripts(fail=True)), \
+                _LogCapture(pull_logger) as log, \
+                mock.patch("sys.stdout", out), mock.patch("sys.stderr", err):
+            assert main(["NVDA"]) == 0
+        assert log.messages(logging.INFO), "the non-quiet run logs its progress lines"
+    print("  the CLI prints one cached/new status line to stderr ✓")
+
+
+def test_a_transcript_label_that_is_not_a_quarter_is_refused_at_the_boundary():
+    """A label the provider cannot name must fail before a request, not MISSING later."""
+    with _TempPlane():
+        s, y, a, t = _Sec(), _Yahoo(), _Estimates(), _Transcripts()
+        try:
+            with _patched(s, y, a, transcripts=t):
+                pull("NVDA", transcripts=["none"])
+        except ValueError as exc:
+            assert "none" in str(exc), exc
+        else:
+            raise AssertionError("a bogus quarter label must be refused")
+        assert (s.calls, y.calls, a.calls, t.calls) == (0, 0, 0, 0), \
+            "the refusal must precede any provider call"
+        # the derived default always names valid quarters — the sentinel cannot leak in
+        assert all(QUARTER_LABEL.fullmatch(q)
+                   for q in last_completed_quarters(date(2026, 5, 10)))
+    print("  a transcript label that is not a quarter is refused before any request ✓")
+
+
+def test_the_cli_refuses_a_sentinel_mixed_with_quarter_labels():
+    """`--transcripts none,2025Q1` must not spend a request asking for quarter `none`."""
+    with _TempPlane():
+        out, err = io.StringIO(), io.StringIO()
+        s, y, a, t = _Sec(), _Yahoo(), _Estimates(), _Transcripts()
+        with _patched(s, y, a, transcripts=t), \
+                mock.patch("sys.stdout", out), mock.patch("sys.stderr", err):
+            assert main(["NVDA", "--transcripts", "none,2025Q1"]) == 1
+        assert "YYYYQN" in err.getvalue(), err.getvalue()
+        assert (s.calls, y.calls, a.calls, t.calls) == (0, 0, 0, 0), \
+            "the refusal must precede any provider call"
+    print("  the CLI refuses a sentinel mixed with quarter labels ✓")
 
 
 def test_export_picks_the_newest_snapshot_carrying_each_table():
@@ -608,7 +826,11 @@ def test_export_picks_the_newest_snapshot_carrying_each_table():
         exported = export_csv("NVDA")
         assert set(exported) == set(everything["table_hashes"]), exported
         assert exported["av_earnings_estimates"] == Path(later["snapshot_dir"]).name
-        older = {t: s for t, s in exported.items() if t != "av_earnings_estimates"}
+        # the derived default carries the held transcript quarters into the later
+        # snapshot too, so its transcript table also comes from there
+        assert exported["av_transcript"] == Path(later["snapshot_dir"]).name
+        later_tables = {"av_earnings_estimates", "av_transcript"}
+        older = {t: s for t, s in exported.items() if t not in later_tables}
         assert set(older.values()) == {Path(everything["snapshot_dir"]).name}, older
         frame = read_table("NVDA", "income_annual_0", run_id=exported["income_annual_0"])
         csv_path = store.CSV / "NVDA" / "income_annual_0.csv"
@@ -620,7 +842,8 @@ def test_the_cli_export_prints_provenance_and_makes_no_network_call():
     with _TempPlane():
         e = _EightK()
         with _patched(_Sec(), _Yahoo(), _Estimates(), e), \
-                mock.patch("sys.stdout", new_callable=io.StringIO):
+                mock.patch("sys.stdout", new_callable=io.StringIO), \
+                mock.patch("sys.stderr", new_callable=io.StringIO):
             assert main(["NVDA", "--earnings-8k", "2"]) == 0, "the acquisition publishes"
         # every provider now fails if touched: the export must ask none of them
         s, y, a = _Sec(fail=True), _Yahoo(fail=True), _Estimates(fail=True)
@@ -849,8 +1072,55 @@ def test_the_cli_refuses_export_combined_with_acquisition_flags():
     print("  --export-csv refuses to silently ignore an acquisition flag ✓")
 
 
+def test_a_degraded_provider_logs_a_warning_with_its_reason():
+    """A dataset that failed is legible in the log, not only in the coverage rows."""
+    with _TempPlane():
+        with _LogCapture(pull_logger) as log:
+            with _patched(_Sec(), _Yahoo(fail=True), _Estimates()):
+                pull("NVDA")
+        warnings = log.messages(logging.WARNING)
+        assert any(m.startswith("yahoo_prices: FAILED") and "yahoo unavailable" in m
+                   for m in warnings), warnings
+        print("  a degraded provider logs a WARNING naming its reason ✓")
+
+
+def test_a_successful_pull_logs_one_finish_line_per_dataset():
+    with _TempPlane():
+        t = _Transcripts()
+        with _LogCapture(pull_logger) as log:
+            with _patched(_Sec(), _Yahoo(), _Estimates(), transcripts=t):
+                result = pull("NVDA")
+        assert result["status"] == "RETRIEVED", result
+        infos = log.messages(logging.INFO)
+        assert any(m.startswith("sec: ") for m in infos), infos
+        assert any(m.startswith("yahoo: ") for m in infos), infos
+        assert "av_earnings_estimates: ok" in infos, infos
+        for quarter in t.quarters:
+            assert f"av_transcript {quarter}: ok" in infos, (quarter, infos)
+        print("  a successful pull logs one finish INFO line per dataset ✓")
+
+
+def test_a_cache_only_hit_logs_cached_and_nothing_else():
+    with _TempPlane():
+        with _patched(_Sec(), _Yahoo(), _Estimates(), transcripts=_Transcripts()):
+            first = pull("NVDA")
+        with _LogCapture(pull_logger) as log:
+            with _patched(_Sec(fail=True), _Yahoo(fail=True), _Estimates(fail=True),
+                          transcripts=_Transcripts(fail=True)):
+                result = pull("NVDA", cache_only=True)
+        assert result["status"] == "CACHED", result
+        assert result["snapshot"]["run_id"] == Path(first["snapshot_dir"]).name, result
+        messages = [r.getMessage() for r in log.records]
+        assert len(messages) == 1, messages
+        assert messages[0] == f"CACHED NVDA: snapshot {Path(first['snapshot_dir']).name}", messages
+        print("  a cache_only hit logs one CACHED line and nothing else ✓")
+
+
 if __name__ == "__main__":
     test_estimate_metadata_names_a_period_field_the_payload_carries()
+    test_last_completed_quarters_follows_the_calendar()
+    test_a_default_pull_derives_the_last_four_completed_quarters()
+    test_a_restricted_default_pull_stays_transcript_free_and_does_not_raise()
     test_a_repeat_pull_is_cached_with_zero_provider_calls()
     test_each_source_set_publishes_its_own_snapshot()
     test_a_failing_provider_becomes_coverage_rows_not_an_exception()
@@ -868,6 +1138,7 @@ if __name__ == "__main__":
     test_a_repeated_quarter_is_asked_for_once()
     test_a_cached_quarter_is_reused_and_the_rest_is_acquired()
     test_the_cli_exits_non_zero_when_nothing_was_published()
+    test_the_cli_prints_the_run_status_to_stderr()
     test_export_picks_the_newest_snapshot_carrying_each_table()
     test_the_cli_export_prints_provenance_and_makes_no_network_call()
     test_eight_k_filings_are_archived_per_filing_and_scoped_by_depth()
@@ -877,4 +1148,9 @@ if __name__ == "__main__":
     test_the_sec_provider_keeps_only_item_202_filings_and_their_exhibit()
     test_export_refuses_a_snapshot_that_lost_a_recorded_table()
     test_the_cli_refuses_export_combined_with_acquisition_flags()
+    test_a_transcript_label_that_is_not_a_quarter_is_refused_at_the_boundary()
+    test_the_cli_refuses_a_sentinel_mixed_with_quarter_labels()
+    test_a_degraded_provider_logs_a_warning_with_its_reason()
+    test_a_successful_pull_logs_one_finish_line_per_dataset()
+    test_a_cache_only_hit_logs_cached_and_nothing_else()
     print("all offline pull tests passed")

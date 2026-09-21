@@ -16,15 +16,24 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 import time
 import uuid
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 import pandas as pd
 
 from . import contracts, store
 from .providers import alphavantage, sec, yahoo  # explicit submodule handles
+
+# The library logs and leaves output to the caller: a NullHandler keeps importable
+# use silent (no last-resort handler writing to stderr), and the CLI configures the
+# stderr handler and level. One finish line per dataset, one WARNING per degraded
+# dataset with its reason — never a line per request.
+logger = logging.getLogger(__name__)
+logger.addHandler(logging.NullHandler())
 
 RESERVED_COLUMNS = {"concept", "label", "dimension"}
 RUN_STATUSES = ("MISSING", "FAILED", "RATE_LIMITED", "PARSE_FAILED")
@@ -46,6 +55,27 @@ TRANSCRIPT_RATE_LIMIT_RETRIES = 3
 # (standard_concept, level, abstract, is_breakdown, …) are not periods.
 PERIOD_COLUMN = re.compile(r"^\d{4}-\d{2}-\d{2} \((Q\d|FY|YTD)\)$")
 POINT_IN_TIME = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+# the transcript quarter label the provider names: `2025Q1`, never `none` or free text
+QUARTER_LABEL = re.compile(r"\d{4}Q[1-4]")
+
+
+def last_completed_quarters(today: date, count: int = 4) -> list[str]:
+    """The `YYYYQN` labels of the `count` most recent *completed* calendar quarters.
+
+    "Completed" is strict: on the last day of a quarter that quarter has not ended
+    yet, so it is not included, while on the first day of a quarter the one that just
+    ended is. The labels are oldest first (newest last), the order the acquisition
+    loop asks them in. The label is the *calendar* quarter: a fiscal-offset issuer
+    whose provider labels differ must be asked for explicitly.
+    """
+    year, quarter = today.year, (today.month - 1) // 3 + 1
+    labels: list[str] = []
+    for _ in range(count):
+        quarter -= 1
+        if quarter == 0:
+            quarter, year = 4, year - 1
+        labels.append(f"{year}Q{quarter}")
+    return labels[::-1]
 
 
 def _period_labels(df: pd.DataFrame | None, dataset: str = "") -> list[str]:
@@ -135,6 +165,7 @@ def _statements_from_sec(issuer: str, ticker: str, ceiling, retrieved_at: str
             except Exception as e:  # noqa: BLE001
                 detail = store.clean_error(e)
                 key = f"{freq}_{index}"
+                logger.warning("sec_%s_%d: FAILED (%s)", freq, index, detail)
                 meta[key] = {"ticker": ticker, "form": form, "status": "FAILED", "detail": detail}
                 rows.append(_row(issuer, f"sec_{freq}_{index}", "FAILED", "NOT_RETRIEVABLE",
                                  {"ticker": ticker, "form": form}, None, retrieved_at, detail=detail))
@@ -160,6 +191,8 @@ def _statements_from_sec(issuer: str, ticker: str, ceiling, retrieved_at: str
                 raise
             except Exception as e:  # noqa: BLE001
                 detail = store.clean_error(e)
+                logger.warning("sec_annual_%d: MISSING (10-K and 20-F both unavailable: %s)",
+                               index, detail)
                 key = f"annual_{index}"
                 meta[key] = {**meta.get(key, {}), "form": "20-F", "fallback_detail": detail}
                 rows = [r for r in rows if r["dataset"] != f"sec_annual_{index}"]
@@ -315,6 +348,9 @@ def pull(ticker: str, *, issuer: str | None = None, sources=None, transcripts=No
     `eight_ks` names how many of the most recent Item 2.02 earnings 8-Ks to archive
     with their Exhibit 99.1; it comes from the sec source and is part of the scope,
     so a run of a different depth is a miss rather than a silently thinner answer.
+    `transcripts` is left as `None` for the default: when alpha_vantage is among the
+    sources the last four completed calendar quarters are acquired, so a caller need
+    not know a quarter label. An explicit list names the quarters, and `[]` opts out.
     `ceilings` names per-provider request limits to enforce, for example
     {"alpha_vantage": 10}. Requests are counted and returned either way.
     """
@@ -324,8 +360,19 @@ def pull(ticker: str, *, issuer: str | None = None, sources=None, transcripts=No
     for source in sources:
         if source not in SOURCES:
             raise ValueError(f"unknown source {source!r}; expected one of {list(SOURCES)}")
+    if transcripts is None and "alpha_vantage" in sources:
+        # a plain pull follows the calendar: the last four completed quarters, so an
+        # agent need not know a quarter label. A source set without alpha_vantage has
+        # no transcript provider to ask, so it stays transcript-free rather than
+        # raising — an explicit `transcripts=[]` is still an opt-out.
+        transcripts = last_completed_quarters(datetime.now(timezone.utc).date())
     # a repeated quarter would spend a second request and write a second coverage row
     transcripts = list(dict.fromkeys(q for q in (transcripts or []) if q))
+    # a label the provider cannot name would spend a real request and record a MISSING
+    # quarter that can never fill — fail at the boundary, before any quota is spent
+    bad_labels = [q for q in transcripts if not QUARTER_LABEL.fullmatch(q)]
+    if bad_labels:
+        raise ValueError(f"transcript labels must be YYYYQN, got {bad_labels!r}")
     eight_ks = int(eight_ks or 0)
     if eight_ks < 0:
         raise ValueError("eight_ks is a count of filings and cannot be negative")
@@ -342,8 +389,10 @@ def pull(ticker: str, *, issuer: str | None = None, sources=None, transcripts=No
     if cache_only:
         hit = _cache_lookup(issuer, key)
         if hit is None:
+            logger.info("no snapshot held for scope %s", key)
             return {"status": "MISSING: NOT_RETRIEVED", "issuer": issuer}
         snap, manifest = hit
+        logger.info("CACHED %s: snapshot %s", issuer, snap.name)
         return {"issuer": issuer, "cache_only": True, "status": "CACHED",
                 "snapshot_dir": str(snap), "snapshot": manifest}
 
@@ -351,6 +400,7 @@ def pull(ticker: str, *, issuer: str | None = None, sources=None, transcripts=No
         hit = _cache_lookup(issuer, key)
         if hit:
             snap, manifest = hit
+            logger.info("CACHED %s: snapshot %s", issuer, snap.name)
             return {
                 "issuer": issuer,
                 "status": "CACHED",
@@ -362,6 +412,7 @@ def pull(ticker: str, *, issuer: str | None = None, sources=None, transcripts=No
                 "note": ("evidence already held for this scope — zero network calls; "
                          "pass --refresh for a new version"),
             }
+        logger.info("no snapshot held for scope %s", key)
 
     ceiling = Ceiling(ceilings or {})
     run_id = f"{store.now_iso().replace(':', '')}-{uuid.uuid4().hex[:6]}"
@@ -379,6 +430,10 @@ def pull(ticker: str, *, issuer: str | None = None, sources=None, transcripts=No
         provider_meta["sec"] = {"status": "RETRIEVED" if st_tables else "FAILED", "filings": st_meta}
         originals.update({k: v["original_path"] for k, v in st_meta.items()
                           if isinstance(v, dict) and v.get("original_path")})
+        retrieved_filings = sum(1 for filing_meta in st_meta.values()
+                                if isinstance(filing_meta, dict)
+                                and filing_meta.get("status") != "FAILED")
+        logger.info("sec: %d filings, %d tables", retrieved_filings, len(st_tables))
 
         # --- earnings 8-Ks (opt-in): Item 2.02 filings and their press releases ---
         if eight_ks:
@@ -410,6 +465,14 @@ def pull(ticker: str, *, issuer: str | None = None, sources=None, transcripts=No
                 rows.append(_row(issuer, "sec_8k", eight_meta.get("status") or "MISSING",
                                  eight_meta.get("reason") or "NOT_RETRIEVABLE", {}, None,
                                  retrieved_at, detail=eight_meta.get("detail")))
+            archived = sum(1 for record in eight_meta.get("filings") or []
+                           if record.get("status") == "RETRIEVED")
+            if archived:
+                logger.info("sec_8k: %d filings archived", archived)
+            else:
+                logger.warning("sec_8k: %s (%s)", eight_meta.get("status") or "MISSING",
+                               eight_meta.get("detail") or eight_meta.get("reason")
+                               or "NOT_RETRIEVABLE")
 
     # --- Yahoo analyst snapshot datasets ---
     if "yahoo" in sources:
@@ -428,9 +491,15 @@ def pull(ticker: str, *, issuer: str | None = None, sources=None, transcripts=No
         originals.update(yf_meta.get("originals") or {})
         failures = yf_meta.get("failures") or {}
         for name, status in yf_meta["statuses"].items():
-            rows.append(_row(issuer, name, status, (yf_meta.get("reasons") or {}).get(name),
-                             {}, yf_frames.get(name), retrieved_at,
-                             detail=failures.get(name) or yf_meta.get("detail")))
+            reason = (yf_meta.get("reasons") or {}).get(name)
+            detail = failures.get(name) or yf_meta.get("detail")
+            rows.append(_row(issuer, name, status, reason, {}, yf_frames.get(name),
+                             retrieved_at, detail=detail))
+            if status != "RETRIEVED":
+                logger.warning("%s: %s (%s)", name, status,
+                               detail or reason or "NOT_RETRIEVABLE")
+        logger.info("yahoo: %d datasets", sum(1 for status in yf_meta["statuses"].values()
+                                               if status == "RETRIEVED"))
 
     # --- Alpha Vantage estimates (reports a missing key rather than raising) ---
     if "alpha_vantage" in sources:
@@ -445,6 +514,13 @@ def pull(ticker: str, *, issuer: str | None = None, sources=None, transcripts=No
         rows.append(_row(issuer, "av_earnings_estimates", av_meta.get("status", "MISSING"),
                          av_meta.get("reason"), {}, None, retrieved_at,
                          detail=av_meta.get("detail")))
+        if av_meta.get("status") == "RETRIEVED":
+            logger.info("av_earnings_estimates: ok")
+        else:
+            logger.warning("av_earnings_estimates: %s (%s)",
+                           av_meta.get("status") or "MISSING",
+                           av_meta.get("detail") or av_meta.get("reason")
+                           or "NOT_RETRIEVABLE")
         if av_data and av_data.get("estimates"):
             tables["av_earnings_estimates"] = pd.DataFrame(av_data["estimates"])
         if av_meta.get("original_path"):
@@ -465,6 +541,7 @@ def pull(ticker: str, *, issuer: str | None = None, sources=None, transcripts=No
                 segments.extend(_held_transcript_segments(snap_dir, quarter))
                 provider_meta.setdefault("alpha_vantage_transcripts", {})[quarter] = {
                     "status": "CACHED", "snapshot": Path(snap_dir).name}
+                logger.info("av_transcript %s: cached", quarter)
                 # carry the cached quarter's preserved original into this snapshot's
                 # manifest too, so every quarter's raw payload is reachable from the
                 # snapshot that cites it — not only from the earlier one
@@ -495,6 +572,13 @@ def pull(ticker: str, *, issuer: str | None = None, sources=None, transcripts=No
             provider_meta.setdefault("alpha_vantage_transcripts", {})[quarter] = {
                 k: v for k, v in meta.items() if k not in ("label",)}
             rows.append(_transcript_row(issuer, quarter, meta, retrieved_at))
+            if meta.get("status") == "RETRIEVED" and data:
+                logger.info("av_transcript %s: ok", quarter)
+            else:
+                logger.warning("av_transcript %s: %s (%s)", quarter,
+                               meta.get("status") or "MISSING",
+                               meta.get("detail") or meta.get("reason")
+                               or "NOT_RETRIEVABLE")
             if meta.get("status") != "RETRIEVED" or not data:
                 # an empty transcript is a MISSING quarter, never a silent success
                 missing.append(quarter)

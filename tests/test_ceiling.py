@@ -20,7 +20,7 @@ from financial_data_pull import store
 from financial_data_pull.providers import alphavantage
 from financial_data_pull.pull import Ceiling, pull
 
-from test_pull_offline import _Estimates, _Sec, _Yahoo, _http, _patched
+from test_pull_offline import _Estimates, _Sec, _Yahoo, _http, _patched, _real_transcript
 from test_store import _TempPlane
 
 TRANSCRIPT = {"symbol": "NVDA", "quarter": "2025Q1",
@@ -75,7 +75,8 @@ def test_a_transcript_breach_is_recorded_not_raised():
             cfg.get.return_value = "key"
             with mock.patch.object(alphavantage.urllib.request, "urlopen",
                                    _http(TRANSCRIPT)):
-                with _patched(_Sec(), _Yahoo(), _Estimates()):
+                with _patched(_Sec(), _Yahoo(), _Estimates(),
+                              transcripts=_real_transcript):
                     result = pull("NVDA", sources=["alpha_vantage"],
                                        transcripts=["2025Q1"],
                                        ceilings={"alpha_vantage_transcripts": 0})

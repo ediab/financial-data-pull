@@ -7,7 +7,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import sys
+from pathlib import Path
 
 from .pull import SOURCES, export_csv, pull
 from .views import export_views
@@ -27,6 +29,59 @@ def _ceiling(text: str) -> dict[str, int]:
             raise ValueError(f"--ceiling {pair!r} is not provider=n")
         limits[provider.strip()] = int(value)
     return limits
+
+
+def _transcripts(text: str) -> list[str]:
+    """`--transcripts` value: the literal `none` opts out with an empty list, anything
+    else is a comma list of quarters."""
+    labels = [q.strip() for q in (text or "").split(",") if q.strip()]
+    if len(labels) == 1 and labels[0].lower() == "none":
+        return []
+    return labels
+
+
+_stderr_handler: logging.Handler | None = None
+
+
+def _setup_logging(quiet: bool) -> None:
+    """Send our log records to stderr; leave an embedder's configuration alone.
+
+    Three cases: a fresh root gets our stderr handler and the level; a root whose
+    handlers are only ours (repeated `main()` calls in one process) gets the level
+    re-decided from `quiet`; a root carrying anyone else's handlers is left entirely
+    alone — handler and level — so an embedder's logging configuration stands.
+    """
+    global _stderr_handler
+    root = logging.getLogger()
+    if root.handlers and _stderr_handler not in root.handlers:
+        return
+    if _stderr_handler is None:
+        _stderr_handler = logging.StreamHandler(sys.stderr)
+        _stderr_handler.setFormatter(logging.Formatter("%(message)s"))
+        root.addHandler(_stderr_handler)
+    root.setLevel(logging.WARNING if quiet else logging.INFO)
+
+
+def _status_line(result: dict) -> str | None:
+    """One human line saying whether the run answered from cache or went to the network.
+
+    The JSON on stdout is the machine-readable record; this is the same answer in a
+    sentence. It reads only fields `pull` already returned — the snapshot basename it
+    published or hit, and the provider request counts — so nothing is recomputed.
+    """
+    status = result.get("status")
+    if status == "CACHED":
+        return (f"CACHED — evidence already held, zero network "
+                f"(snapshot {Path(result.get('snapshot_dir') or '').name})")
+    if status == "MISSING: NOT_RETRIEVED":
+        return f"no data held for {result.get('issuer')} (cache-only)"
+    if status in UNPUBLISHED_STATUSES:
+        return f"{status} — nothing published"
+    if status == "RETRIEVED":
+        spent = sum((result.get("requests") or {}).values())
+        return (f"NEW SNAPSHOT {Path(result.get('snapshot_dir') or '').name} — "
+                f"{spent} requests spent")
+    return None
 
 
 def _export(issuer: str) -> int:
@@ -69,7 +124,9 @@ def main(argv: list[str] | None = None) -> int:
                    help=f"comma-separated source set ({', '.join(SOURCES)}); default: all")
     p.add_argument("--transcripts", default=None,
                    help="earnings-call quarters to acquire, comma-separated YYYYQN labels "
-                        "(for example 2025Q1,2025Q2); needs alpha_vantage")
+                        "(for example 2025Q1,2025Q2); default: the last 4 completed "
+                        "calendar quarters, which needs alpha_vantage — pass \"none\" to "
+                        "opt out")
     p.add_argument("--earnings-8k", type=int, default=None, metavar="N",
                    help="archive the N most recent Item 2.02 earnings 8-Ks with their "
                         "Exhibit 99.1 press release; needs sec")
@@ -85,10 +142,15 @@ def main(argv: list[str] | None = None) -> int:
                         "acquisition flags")
     p.add_argument("--refresh", action="store_true", help="add a new snapshot version")
     p.add_argument("--cache-only", action="store_true", help="zero network requests")
+    p.add_argument("--quiet", action="store_true",
+                   help="log warnings only; silences the per-dataset progress lines "
+                        "and the run status line")
     p.add_argument("--ceiling", default=None,
                    help="per-provider request limits, for example alpha_vantage=10,sec=40; "
                         "transcripts count under their own alpha_vantage_transcripts key")
     args = p.parse_args(argv)
+
+    _setup_logging(args.quiet)
 
     if args.export_csv or args.export_views:
         flags = [flag for flag, given in (("--export-csv", args.export_csv),
@@ -114,14 +176,18 @@ def main(argv: list[str] | None = None) -> int:
         result = pull(args.ticker, issuer=args.issuer,
                       sources=[s.strip() for s in args.sources.split(",") if s.strip()]
                       if args.sources else None,
-                      transcripts=[q.strip() for q in (args.transcripts or "").split(",")
-                                   if q.strip()],
+                      transcripts=_transcripts(args.transcripts)
+                      if args.transcripts is not None else None,
                       eight_ks=args.earnings_8k,
                       cache_only=args.cache_only, refresh=args.refresh,
                       ceilings=_ceiling(args.ceiling) if args.ceiling else None)
     except (ValueError, PermissionError) as exc:
         print(exc, file=sys.stderr)
         return 1
+    if not args.quiet:
+        line = _status_line(result)
+        if line:
+            print(line, file=sys.stderr)
     print(json.dumps(result, indent=2, default=str))
     return 1 if result.get("status") in UNPUBLISHED_STATUSES else 0
 

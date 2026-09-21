@@ -35,9 +35,15 @@ details.
 .venv/bin/financial-data-pull NVDA --cache-only           # zero network
 .venv/bin/financial-data-pull NVDA --ceiling alpha_vantage=10,sec=40
 .venv/bin/financial-data-pull NVDA --earnings-8k 10       # 10 earnings press releases
+.venv/bin/financial-data-pull NVDA --transcripts none     # no transcripts this pull
+.venv/bin/financial-data-pull NVDA --quiet                # warnings only
 .venv/bin/financial-data-pull NVDA --export-csv           # CSVs, zero network
 .venv/bin/financial-data-pull NVDA --export-views         # derived views, zero network
 ```
+
+The JSON result is printed to stdout. One line per dataset (INFO) and one human
+status line for the run go to **stderr**, so redirecting stdout still captures just
+the JSON. `--quiet` drops those stderr lines to warnings only.
 
 Or from Python:
 
@@ -46,10 +52,12 @@ from financial_data_pull import export_csv, manifest, pull, read_table
 from financial_data_pull.views import export_views
 
 result = pull("NVDA")                  # first call: network + a new snapshot
+                                       # (statements, prices and the last 4 transcripts)
 pull("NVDA")                           # {"status": "CACHED", ...} — zero network
 pull("NVDA", refresh=True)             # add a new snapshot version
 pull("NVDA", cache_only=True)          # never touches the network
 pull("NVDA", sources=["yahoo"])        # its own snapshot, its own refresh cadence
+pull("NVDA", transcripts=[])           # opt out of the default transcripts
 pull("NVDA", sources=["alpha_vantage"], transcripts=["2026Q1", "2026Q2"])
 pull("NVDA", eight_ks=10)              # Item 2.02 8-Ks + their Exhibit 99.1
 
@@ -70,8 +78,7 @@ newest snapshot that actually holds it.
 |---|---|---|
 | SEC EDGAR (edgartools) | 33 | 3 annual 10-K + 8 quarterly 10-Q → `income_`, `balance_`, `cashflow_` each, `_annual_0..2` / `_quarterly_0..7` (index 0 is the most recent filing) |
 | Yahoo (yfinance) | 8 | `yahoo_prices` (1 year of daily bars) + 7 analyst datasets (`yahoo_earnings_estimate`, `yahoo_revenue_estimate`, `yahoo_eps_trend`, `yahoo_eps_revisions`, `yahoo_analyst_price_targets`, `yahoo_recommendations`, `yahoo_upgrades_downgrades`) |
-| Alpha Vantage | 1 | `av_earnings_estimates` — one request |
-| Alpha Vantage (opt-in) | 1 | `av_transcript`, one call per `YYYYQN` quarter, 1.5s spacing, retried on the free tier's limiter |
+| Alpha Vantage | 2 | `av_earnings_estimates` (one request) + `av_transcript`, one call per quarter of the last 4 **completed** calendar quarters derived from today (1.5s spacing, retried on the free tier's limiter). Transcripts are acquired only when `alpha_vantage` is among `sources`; `--transcripts none` (or `transcripts=[]`) opts out, and an explicit `YYYYQN` list names the quarters instead |
 | SEC EDGAR (opt-in) | 1 | `sec_8k` — one row per Item 2.02 earnings 8-K (ticker, filing date, accession, items, exhibit file and path). The Exhibit 99.1 press release is preserved untouched under `raw/`; `--earnings-8k N` sets how many filings, newest first |
 
 SEC tables are one row per XBRL concept. Period columns are labelled as the filing
@@ -159,9 +166,17 @@ only original is a ~9 MB full-text submission, and their statements are already 
   The cache key is the issuer, the ticker, the source set, the transcript quarters
   and the 8-K depth, and it contains no date — so the cache never expires on its
   own. Freshness is the explicit `refresh=True`. Because the key is per source set, a
-  daily Yahoo refresh does not re-pull 11 SEC filings. A pull without 8-Ks keys
-  exactly as it did before the 8-K parameter existed, so existing snapshots keep
-  answering from the cache.
+  daily Yahoo refresh does not re-pull 11 SEC filings. A pull without 8-Ks keeps the
+  8-K component of its key exactly as it was before the 8-K parameter existed.
+- **The default scope moves once per calendar quarter.** A plain pull derives its
+  transcript quarters from today, so the key changes at each rollover: the first plain
+  pull after one is a **full re-acquisition of the whole source set** — SEC (~22
+  requests, ~98 MB of originals), Yahoo, estimates and the one new transcript — not
+  just the new quarter. Every quarter already held costs nothing. Pass
+  `transcripts=[]` (`--transcripts none`) for a scope that never moves. A quarter
+  Alpha Vantage has not posted yet — a call that just ended, typically — is recorded
+  `MISSING`, and because the scope then caches, later plain pulls keep missing it
+  until `refresh=True` (`--refresh`) retries it.
 - **`cache_only=True` never touches the network**, and returns
   `{"status": "MISSING: NOT_RETRIEVED"}` when nothing is held for that scope.
 
@@ -169,10 +184,15 @@ only original is a ~9 MB full-text submission, and their statements are already 
 
 Alpha Vantage is a source for earnings estimates and transcripts and nothing
 else — it is never a price source and never a fallback for Yahoo. The free tier is
-tightly limited, so a plain `pull(ticker)` costs exactly one request, transcripts
-are opt-in, and `--ceiling` caps a run (requests are counted and returned either
-way). Transcript calls are counted under their own `alpha_vantage_transcripts` key,
-so `--ceiling alpha_vantage=10,alpha_vantage_transcripts=2` caps the two
+tightly limited, so a plain `pull(ticker)` spends up to five requests on a first
+acquisition — one for `av_earnings_estimates` and one per transcript quarter, four by
+default. A quarter already held in a snapshot costs zero. A calendar-quarter rollover
+is a new scope, so its first plain pull spends the two AV requests that scope needs —
+one for estimates, one for the newly completed transcript — plus the SEC and Yahoo
+re-acquisition the new scope implies. `--ceiling` caps a run (requests are counted and
+returned either way).
+Transcript calls are counted under their own `alpha_vantage_transcripts` key, so
+`--ceiling alpha_vantage=10,alpha_vantage_transcripts=2` caps the two
 independently.
 
 Yahoo is unofficial: yfinance changes under you, and a failure there shows up as
@@ -186,8 +206,10 @@ archived (the filing's full-text submission, which also carries the exhibit) plu
 few for the filing index itself, and those requests count under the same
 `--ceiling sec=N` key. A run with 8-Ks is a new
 scope: the first one re-acquires its whole source set — Yahoo, Alpha Vantage and all
-11 SEC filings — and not only the 8-Ks. When only the documents are wanted, name
-`--sources sec`.
+11 SEC filings — and not only the 8-Ks. The same holds for a transcript quarter the
+default scope has newly picked up. When only the documents are wanted, name
+`--sources sec` (which also keeps the run transcript-free, since transcripts need
+`alpha_vantage`).
 
 ## Tests
 
