@@ -24,7 +24,6 @@ from pathlib import Path
 import pandas as pd
 
 from . import contracts, store
-from . import providers  # noqa: F401 — imports the package so submodule attrs exist
 from .providers import alphavantage, sec, yahoo  # explicit submodule handles
 
 RESERVED_COLUMNS = {"concept", "label", "dimension"}
@@ -36,7 +35,6 @@ STATEMENT_PREFIXES = ("income_", "balance_", "cashflow_")
 # the source sets a snapshot can be scoped to; a snapshot satisfies only the
 # scope it was acquired for, so each may be refreshed on its own schedule
 SOURCES = ("sec", "alpha_vantage", "yahoo")
-DEFAULT_SOURCES = SOURCES
 
 # Alpha Vantage's free tier allows roughly one request per second and returns a
 # rate-limit message rather than an HTTP error when a burst exceeds it. Transcripts
@@ -195,13 +193,14 @@ def _transcript_row(issuer: str, quarter: str, meta: dict, retrieved_at: str) ->
     return {k: v for k, v in row.items() if v is not None}
 
 
-def held_transcript_quarters(issuer: str) -> dict[str, str]:
-    """company+quarter -> the frozen snapshot that already holds it (no network).
+def held_transcript_quarters(issuer: str) -> dict[str, tuple[str, str | None]]:
+    """company+quarter -> (the frozen snapshot holding it, its preserved original).
 
     A frozen transcript is evidence: a later acquisition reuses it rather than
-    re-pulling, so the provider is asked once per quarter unless `--refresh`.
+    re-pulling, so the provider is asked once per quarter unless `--refresh`. Both
+    facts come from the one manifest already being read — no extra file reads.
     """
-    held: dict[str, str] = {}
+    held: dict[str, tuple[str, str | None]] = {}
     for snap in reversed(store.snapshot_dirs(issuer)):
         manifest_path = snap / "snapshot.json"
         if not manifest_path.is_file():
@@ -219,7 +218,9 @@ def held_transcript_quarters(issuer: str) -> dict[str, str]:
             if (str(row.get("dataset") or "").startswith("av_transcript_")
                     and row.get("acquisition") == "RETRIEVED" and quarter
                     and quarter not in held):
-                held[quarter] = str(snap)
+                held[quarter] = (str(snap),
+                                 (manifest.get("originals") or {})
+                                 .get(f"av_transcript_{quarter}"))
     return held
 
 
@@ -270,8 +271,8 @@ def scope_key(issuer: str, sources, transcripts) -> str:
                                      separators=(",", ":")).encode()).hexdigest()
 
 
-def _cache_lookup(issuer: str, scope_key: str) -> dict | None:
-    """Reuse evidence already held for this acquisition scope.
+def _cache_lookup(issuer: str, scope_key: str) -> tuple[Path, dict] | None:
+    """The evidence already held for this acquisition scope, if any.
 
     A plain pull is cache-first: a snapshot acquired for the same issuer, source
     set and transcript quarters is returned with zero network calls. New
@@ -280,17 +281,7 @@ def _cache_lookup(issuer: str, scope_key: str) -> dict | None:
     for snap in reversed(store.snapshot_dirs(issuer)):
         manifest = json.loads((snap / "snapshot.json").read_text())
         if manifest.get("scope_key") == scope_key:
-            return {
-                "issuer": issuer,
-                "status": "CACHED",
-                "snapshot_dir": str(snap),
-                "retrieved_at": manifest.get("retrieved_at"),
-                "coverage_path": manifest.get("coverage_path"),
-                "tables": len(manifest.get("table_hashes") or {}),
-                "originals": len(manifest.get("originals") or {}),
-                "note": ("evidence already held for this scope — zero network calls; "
-                         "pass --refresh for a new version"),
-            }
+            return snap, manifest
     return None
 
 
@@ -310,7 +301,7 @@ def pull(ticker: str, *, issuer: str | None = None, sources=None, transcripts=No
     `ceilings` names per-provider request limits to enforce, for example
     {"alpha_vantage": 10}. Requests are counted and returned either way.
     """
-    sources = list(sources or DEFAULT_SOURCES)
+    sources = list(sources or SOURCES)
     for source in sources:
         if source not in SOURCES:
             raise ValueError(f"unknown source {source!r}; expected one of {list(SOURCES)}")
@@ -323,17 +314,28 @@ def pull(ticker: str, *, issuer: str | None = None, sources=None, transcripts=No
     key = scope_key(issuer, sources, transcripts)
 
     if cache_only:
-        for snap in reversed(store.snapshot_dirs(issuer)):
-            manifest = json.loads((snap / "snapshot.json").read_text())
-            if manifest.get("scope_key") == key:
-                return {"issuer": issuer, "cache_only": True, "status": "CACHED",
-                        "snapshot_dir": str(snap), "snapshot": manifest}
-        return {"status": "MISSING: NOT_RETRIEVED", "issuer": issuer}
+        hit = _cache_lookup(issuer, key)
+        if hit is None:
+            return {"status": "MISSING: NOT_RETRIEVED", "issuer": issuer}
+        snap, manifest = hit
+        return {"issuer": issuer, "cache_only": True, "status": "CACHED",
+                "snapshot_dir": str(snap), "snapshot": manifest}
 
     if not refresh:
-        cached = _cache_lookup(issuer, key)
-        if cached:
-            return {**cached, "status": "CACHED"}
+        hit = _cache_lookup(issuer, key)
+        if hit:
+            snap, manifest = hit
+            return {
+                "issuer": issuer,
+                "status": "CACHED",
+                "snapshot_dir": str(snap),
+                "retrieved_at": manifest.get("retrieved_at"),
+                "coverage_path": manifest.get("coverage_path"),
+                "tables": len(manifest.get("table_hashes") or {}),
+                "originals": len(manifest.get("originals") or {}),
+                "note": ("evidence already held for this scope — zero network calls; "
+                         "pass --refresh for a new version"),
+            }
 
     ceiling = Ceiling(ceilings or {})
     run_id = f"{store.now_iso().replace(':', '')}-{uuid.uuid4().hex[:6]}"
@@ -400,21 +402,17 @@ def pull(ticker: str, *, issuer: str | None = None, sources=None, transcripts=No
         spacing = TRANSCRIPT_MIN_INTERVAL_SECONDS
         for quarter in wanted:
             if quarter in held:
+                snap_dir, original = held[quarter]
                 rows.append(_transcript_row(issuer, quarter, {"status": "RETRIEVED"},
                                             retrieved_at))
-                segments.extend(_held_transcript_segments(held[quarter], quarter))
+                segments.extend(_held_transcript_segments(snap_dir, quarter))
                 provider_meta.setdefault("alpha_vantage_transcripts", {})[quarter] = {
-                    "status": "CACHED", "snapshot": Path(held[quarter]).name}
+                    "status": "CACHED", "snapshot": Path(snap_dir).name}
                 # carry the cached quarter's preserved original into this snapshot's
                 # manifest too, so every quarter's raw payload is reachable from the
                 # snapshot that cites it — not only from the earlier one
-                held_manifest_path = Path(held[quarter]) / "snapshot.json"
-                if held_manifest_path.is_file():
-                    held_originals = (json.loads(held_manifest_path.read_text())
-                                      .get("originals") or {})
-                    origin = held_originals.get(f"av_transcript_{quarter}")
-                    if origin:
-                        originals[f"av_transcript_{quarter}"] = origin
+                if original:
+                    originals[f"av_transcript_{quarter}"] = original
                 continue
             if live_calls and spacing:
                 time.sleep(spacing)  # respect the free tier rather than tripping its limiter

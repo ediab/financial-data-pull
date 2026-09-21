@@ -6,10 +6,10 @@ memo and workbook work belongs in the consuming project.
 
 ## Read first
 
-- `docs/plans/2026-09-21-financial-data-pull.md` — the implementation plan. It
-  records why each deviation from upstream exists, and the per-file lists of what
-  may change. Read it before touching `store.py` or `pull.py`.
-- `docs/specs/2026-09-21-financial-data-pull.md` — the agreed brief.
+- `README.md` — what the library pulls, where the data lands, and the guarantees
+  the store provides.
+- `tests/run_all.sh` — three offline suites that pin those guarantees; read the
+  suite covering the path you are about to change.
 
 ## Conventions the code does not show
 
@@ -19,11 +19,6 @@ memo and workbook work belongs in the consuming project.
   and `providers.alphavantage.*`, and wrap the store with
   `tests/test_store._TempPlane`, so a suite run touches neither the network nor the
   repo's `data/`. `bash tests/run_all.sh` runs all three suites.
-- **Copied code stays in step with upstream.** `config.py`, `store.py`,
-  `contracts.py` and `providers/*` are copies of
-  `~/Dev/equity-research/src/equity_research/`. To change one, copy the upstream
-  file again and re-apply the intended delta (the plan lists them per file) rather
-  than hand-editing both copies.
 - **The store's guarantees are the product.** Atomic publish, immutable snapshots,
   hash-checked reads, and per-dataset status with a reason are what this library is
   for. A change near `save_raw`, `commit_snapshot` or `read_verified_table` earns a

@@ -7,3 +7,6 @@ __pycache__/
 *.pyc
 .pytest_cache/
 .DS_Store
+
+# pi task state (shared between sessions, never versioned)
+.pi/

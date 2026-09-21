@@ -1,25 +1,21 @@
-"""Minimal JSON-contract validation helpers (Stage 1: no external deps).
+"""Minimal JSON-contract validation helpers.
 
-Stage 2.5c widened these helpers beyond "required key exists": types, enums,
-numeric bounds, string patterns, array sizes, uniqueness, and schema-declared
-conditional requirements. They remain a small, readable validator rather than a
-full JSON-Schema engine — but a contract that says `{}` is wrong must now
-actually reject `{}`.
+One contract: `schemas/coverage.json`. These helpers check what it declares —
+required keys, a single type per property, enums, array items and `required_when`
+conditionals — and are deliberately not a general JSON-Schema engine. Sounding
+exhaustive about everything else would be a promise this code does not keep.
 """
 from __future__ import annotations
 
 import json
-import re
 from pathlib import Path
 from typing import Any
 
-# Contracts live at the repository root (single source of truth, per the plan) and are
-# copied into the package by the build (pyproject force-include), so an installed copy
-# can validate too. Prefer the packaged copy when it is populated.
-_PACKAGE_SCHEMAS = Path(__file__).resolve().parent / "schemas"
-_REPO_SCHEMAS = Path(__file__).resolve().parent.parent.parent / "schemas"
-SCHEMA_DIR = (_PACKAGE_SCHEMAS if _PACKAGE_SCHEMAS.is_dir()
-              and any(_PACKAGE_SCHEMAS.glob("*.json")) else _REPO_SCHEMAS)
+import pandas as pd
+
+# Contracts live at the repository root: the single source of truth for the shapes
+# this package reads and writes.
+SCHEMA_DIR = Path(__file__).resolve().parent.parent.parent / "schemas"
 
 _TYPE_CHECKS = {
     "string": lambda v: isinstance(v, str),
@@ -35,12 +31,6 @@ _TYPE_CHECKS = {
 def load_schema(name: str) -> dict[str, Any]:
     path = SCHEMA_DIR / f"{name}.json"
     return json.loads(path.read_text())
-
-
-def read_table(path):
-    """Read a parquet table (pandas, pyarrow already a dependency of the stack)."""
-    import pandas as pd
-    return pd.read_parquet(path)
 
 
 def read_verified_table(snap_dir, table: str):
@@ -64,14 +54,16 @@ def read_verified_table(snap_dir, table: str):
         raise ValueError(
             f"hash mismatch for {table} in {snap_dir.name}: stored {expected[:12]}… "
             f"but file hashes to {actual[:12]}…")
-    return read_table(path)
+    return pd.read_parquet(path)
 
 
 def _type_ok(value: Any, declared: Any) -> bool:
-    types = [declared] if isinstance(declared, str) else list(declared or [])
-    if not types:
+    """A declared type is a single name from the table above; a type array is beyond
+    this validator and left unchecked. The one exception is a required key holding an
+    explicit null: that is judged in `check_object`, against a `"null"` type."""
+    if not isinstance(declared, str):
         return True
-    return any(_TYPE_CHECKS.get(t, lambda _v: True)(value) for t in types)
+    return _TYPE_CHECKS.get(declared, lambda _v: True)(value)
 
 
 def validate_against(instance: dict[str, Any], schema_name: str) -> list[str]:
@@ -86,72 +78,28 @@ def validate_against(instance: dict[str, Any], schema_name: str) -> list[str]:
             return
         if "enum" in prop and value not in prop["enum"]:
             errors.append(f"{schema_name}: {path} {value!r} is not one of {prop['enum']}")
-        if isinstance(value, (int, float)) and not isinstance(value, bool):
-            if "minimum" in prop and value < prop["minimum"]:
-                errors.append(f"{schema_name}: {path} {value} is below the minimum "
-                              f"{prop['minimum']}")
-            if "maximum" in prop and value > prop["maximum"]:
-                errors.append(f"{schema_name}: {path} {value} is above the maximum "
-                              f"{prop['maximum']}")
-        if isinstance(value, str):
-            if prop.get("pattern") and not re.match(prop["pattern"], value):
-                errors.append(f"{schema_name}: {path} {value!r} does not match "
-                              f"{prop['pattern']}")
-            if "minLength" in prop and len(value) < prop["minLength"]:
-                errors.append(f"{schema_name}: {path} must be at least "
-                              f"{prop['minLength']} characters")
-        if isinstance(value, dict) and "minProperties" in prop:
-            if len(value) < prop["minProperties"]:
-                errors.append(f"{schema_name}: {path} needs at least "
-                              f"{prop['minProperties']} key(s)")
 
     def check_object(obj: Any, schema_obj: dict, path: str) -> None:
         if not isinstance(obj, dict):
             errors.append(f"{schema_name}: {path or 'root'} must be an object")
             return
-        for key in schema_obj.get("required", []):
-            if key not in obj:
-                errors.append(f"{schema_name}: {path}missing required key '{key}'")
-                continue
-            # an explicit null is a present value: fields typed [type, null] are
-            # legitimately MISSING-labelled, which is the honest state, not an
-            # absent key
-            if obj[key] is None:
-                allowed = (schema_obj.get("properties", {}).get(key, {}) or {}).get("type")
-                nullable = allowed is not None and (
-                    (isinstance(allowed, list) and "null" in allowed)
-                    or allowed == "null")
-                if not nullable:
-                    errors.append(f"{schema_name}: {path}missing required key '{key}'")
         props = schema_obj.get("properties", {})
+        for key in schema_obj.get("required", []):
+            # an explicit null counts as present only when the contract types the
+            # property as null; otherwise the required value is missing
+            if key not in obj or (obj[key] is None
+                                  and (props.get(key) or {}).get("type") != "null"):
+                errors.append(f"{schema_name}: {path}missing required key '{key}'")
         for key, prop in props.items():
             if key not in obj:
                 continue
             value = obj[key]
             check_value(value, prop, f"{path}{key}")
-            if prop.get("type") == "object" and isinstance(value, dict):
-                # recurse so a nested enum/pattern (e.g. run.json intake.state) is
-                # actually enforced, not merely present in the schema
-                check_object(value, prop, f"{path}{key}.")
             if prop.get("type") == "array" and isinstance(value, list):
-                if "minItems" in prop and len(value) < prop["minItems"]:
-                    errors.append(f"{schema_name}: {path}{key} needs at least "
-                                  f"{prop['minItems']} item(s)")
                 item = prop.get("items", {})
                 if item.get("type") == "object":
                     for i, entry in enumerate(value):
                         check_object(entry, item, f"{path}{key}[{i}].")
-                for spec in prop.get("unique_by", []):
-                    fields = spec if isinstance(spec, list) else [spec]
-                    seen = []
-                    for i, entry in enumerate(value):
-                        if not isinstance(entry, dict):
-                            continue
-                        got = tuple(entry.get(f) for f in fields)
-                        if got in seen:
-                            errors.append(f"{schema_name}: {path}{key}[{i}] duplicates "
-                                          f"{'/'.join(fields)} {got}")
-                        seen.append(got)
         for rule in schema_obj.get("required_when", []):
             trigger = obj.get(rule.get("key"))
             if trigger in rule.get("values", []):

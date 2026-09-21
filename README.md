@@ -7,9 +7,9 @@ the network.
 It acquires and caches data. It does not interpret it: no model, no checks, no
 valuation.
 
-This is the acquisition and caching layer of `~/Dev/equity-research` extracted
-into its own project, with the research workflow removed (no approval gates, no
-cases, no proposals, no memo, no workbooks, no FRED).
+The scope is deliberately narrow: no approval gates, no cases, no proposals, no
+memo, no workbooks, no FRED and no macro series. The pull and its cache are the
+whole product.
 
 ## Install
 
@@ -122,4 +122,4 @@ bash tests/run_all.sh     # three suites, all offline: providers are doubled
 
 The model, checks, valuation, delivery, memo, workbooks, Excel recalculation,
 company-document fetching, PDF parsing, DuckDB, FRED and macro series. They live
-downstream of the pull, in `~/Dev/equity-research` and its successors.
+downstream of the pull.

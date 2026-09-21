@@ -304,6 +304,14 @@ def test_a_cached_quarter_is_reused_and_the_rest_is_acquired():
         frame = read_table("NVDA", "av_transcript",
                                 run_id=Path(second["snapshot_dir"]).name)
         assert sorted(frame["quarter"].unique()) == ["2025Q1", "2025Q2"], frame
+        # …and so is its preserved original, or the new snapshot would cite a payload
+        # it cannot reach. Read the pinned snapshot's own manifest: `manifest("NVDA")`
+        # resolves to the newest run, not the one this assertion is about.
+        first_manifest = json.loads((Path(first["snapshot_dir"]) / "snapshot.json").read_text())
+        second_manifest = json.loads((Path(second["snapshot_dir"]) / "snapshot.json").read_text())
+        carried = second_manifest["originals"]["av_transcript_2025Q1"]
+        assert carried == first_manifest["originals"]["av_transcript_2025Q1"], carried
+        assert Path(carried).is_file(), carried
         print("  a held quarter is reused with zero calls and carried into the new snapshot ✓")
 
 

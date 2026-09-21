@@ -135,10 +135,30 @@ def test_save_raw_is_content_addressed_and_re_verified():
         print("  raw payloads are content-addressed and re-verified on write ✓")
 
 
+def test_the_coverage_contract_rejects_what_it_declares():
+    valid = {"issuer": "TEST", "run_id": "snap-1",
+             "rows": [{"company": "TEST", "dataset": "sec_annual_0",
+                       "period": "10-K 2025-01-31", "acquisition": "FAILED",
+                       "verification": "UNCHECKED", "origin": "AUTOMATIC",
+                       "reason": "NOT_RETRIEVABLE"}]}
+    assert contracts.validate_against(valid, "coverage") == []
+    row = valid["rows"][0]
+    for broken, expected in (
+            ({**valid, "rows": [{k: v for k, v in row.items() if k != "company"}]}, "company"),
+            ({**valid, "run_id": None}, "run_id"),
+            ({**valid, "rows": [{**row, "acquisition": "NOPE"}]}, "acquisition"),
+            ({**valid, "rows": [{k: v for k, v in row.items() if k != "reason"}]}, "reason")):
+        violations = contracts.validate_against(broken, "coverage")
+        assert violations, broken
+        assert any(expected in v for v in violations), (expected, violations)
+    print("  the coverage contract rejects a missing key, a null, a bad enum and a bare gap ✓")
+
+
 if __name__ == "__main__":
     test_a_staging_directory_is_invisible()
     test_commit_refuses_an_incomplete_or_duplicate_snapshot()
     test_a_changed_table_file_is_refused()
     test_safe_component_rejects_escapes()
     test_save_raw_is_content_addressed_and_re_verified()
+    test_the_coverage_contract_rejects_what_it_declares()
     print("all store tests passed")
