@@ -191,8 +191,8 @@ def main(argv: list[str] | None = None) -> int:
                    help=f"comma-separated source set ({', '.join(SOURCES)}); default: all")
     p.add_argument("--transcripts", default=None,
                    help="earnings-call quarters to acquire, comma-separated YYYYQN labels "
-                        "(for example 2025Q1,2025Q2); default: up to 12 quarters derived "
-                        "from SEC filing periods when alpha_vantage is requested — pass "
+                        "(for example 2025Q1,2025Q2); default: the newest 2 quarters "
+                        "derived from SEC filing periods when alpha_vantage is requested — pass "
                         "\"none\" to opt out; without SEC evidence, supply labels")
     p.add_argument("--earnings-8k", type=int, default=None, metavar="N",
                    help="archive the N most recent Item 2.02 earnings 8-Ks with their "

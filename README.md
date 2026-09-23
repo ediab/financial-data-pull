@@ -82,14 +82,16 @@ columns}}`) rather than DataFrame contents.
 
 A plain call for any held ticker serves the verified union of its snapshots with zero
 network; filters shape that bundle. Only `refresh=True` acquires and folds held
-evidence forward. The canonical scope is 12 reported quarters, with 12 earnings
-releases by default when SEC is requested (`eight_ks=0` opts out). To acquire a
-changed release depth, use `refresh=True`; it acquires the full requested source set.
-Transcript labels
-derive from SEC filing periods; when no SEC evidence exists, pass explicit labels. A
-held ticker's first refresh may re-acquire the full source set once because the
-canonical scope widened. An acquisition can make up to 12 Alpha Vantage transcript
-calls at 1.5-second spacing; a quarter already held is never re-asked.
+evidence forward. An acquisition covers 12 statement quarter-ends and, with SEC
+requested, 12 earnings releases by default (`eight_ks=0` opts out); transcripts
+default to the newest 2 reported quarters, because each call is a scarce provider
+request. To acquire a changed depth, use `refresh=True`, which acquires the full
+requested source set; an explicit `transcripts=[…]` list asks for as many quarters as
+you name. Transcript labels derive from SEC filing periods; when no SEC evidence
+exists, pass explicit labels. A held ticker's first refresh may re-acquire the full
+source set once because the canonical scope widened. A quarter already held is never
+re-asked, and a served bundle carries every held quarter whatever depth a new
+acquisition would ask for.
 
 Report tolerances: statement arithmetic within $1,000 of filing rounding; release
 ties within 0.5 × the release's stated scale (1e6, then 1e3); cash reconciliation
@@ -101,7 +103,7 @@ below `0.05 × 5e9`; and 12 contiguous quarter ends with 80–105-day gaps (11 n
 |---|---|---|
 | SEC EDGAR (edgartools) | up to 36 | 3 annual 10-K + 9 quarterly 10-Q → `income_`, `balance_`, `cashflow_` each, `_annual_0..2` / `_quarterly_0..8` (index 0 is the most recent filing) |
 | Yahoo (yfinance) | 8 | `yahoo_prices` (1 year of daily bars) + 7 analyst datasets (`yahoo_earnings_estimate`, `yahoo_revenue_estimate`, `yahoo_eps_trend`, `yahoo_eps_revisions`, `yahoo_analyst_price_targets`, `yahoo_recommendations`, `yahoo_upgrades_downgrades`) |
-| Alpha Vantage | 2 | `av_earnings_estimates` (one request) + `av_transcript`, up to 12 filing-reported quarters (1.5s spacing, retried on the free tier's limiter). Transcripts require `alpha_vantage`; labels derive from held SEC filing periods, or the current SEC fetch on a first acquisition. Without SEC evidence, supply explicit `YYYYQN` labels. `--transcripts none` (or `transcripts=[]`) opts out |
+| Alpha Vantage | 2 | `av_earnings_estimates` (one request) + `av_transcript`, the newest 2 filing-reported quarters by default (1.5s spacing, retried on the free tier's limiter); name explicit `YYYYQN` labels to ask for more. Transcripts require `alpha_vantage`; labels derive from held SEC filing periods, or the current SEC fetch on a first acquisition. Without SEC evidence, supply explicit labels. `--transcripts none` (or `transcripts=[]`) opts out |
 | SEC EDGAR | 1 | `sec_8k` — one row per Item 2.02 earnings 8-K (ticker, filing date, accession, items, exhibit file and path). The Exhibit 99.1 press release is preserved untouched under `raw/`; default depth is 12 with SEC, `--earnings-8k N` changes it and `0` opts out |
 
 SEC tables are one row per XBRL concept. Period columns are labelled as the filing
@@ -199,11 +201,12 @@ a hand-written index would.
   serves the verified union of its evidence with zero network; source, transcript,
   and release filters shape the bundle. `refresh=True` acquires and folds held
   evidence forward. Scope keys remain acquisition facts, not the serve condition.
-  The canonical scope widened to 12 reported quarters and 12 releases, so a held
-  ticker's first refresh may re-acquire its whole source set once (~22 SEC statement
-  requests and ~98 MB originals, plus other requested sources). Held transcript
-  quarters are frozen and never re-asked. Default transcript labels come from SEC
-  filing periods; a source set without SEC evidence requires explicit labels.
+  Acquisition covers 12 statement quarter-ends and 12 releases; a held ticker's first
+  refresh may re-acquire its whole source set once (~22 SEC statement requests and
+  ~98 MB originals, plus other requested sources). Held transcript quarters are frozen
+  and never re-asked, and a serve returns every held quarter. Default transcript labels
+  come from SEC filing periods and ask for the newest 2; a source set without SEC
+  evidence requires explicit labels.
   Missing provider quarters are recorded as gaps; use `refresh=True` to retry.
 - **`cache_only=True` never touches the network**, and returns
   `{"status": "MISSING: NOT_RETRIEVED"}` when no ticker-matching snapshot is held.
@@ -212,7 +215,8 @@ a hand-written index would.
 
 Alpha Vantage is a source for earnings estimates and transcripts and nothing
 else — it is never a price source and never a fallback for Yahoo. Its free tier is
-tightly limited. An acquisition may make up to 12 transcript calls, spaced at 1.5
+tightly limited. An acquisition asks for the newest 2 transcript quarters by default —
+an explicit `--transcripts 2024Q1,…` list asks for as many as you name — spaced at 1.5
 seconds; a quarter already held is frozen evidence and never re-asked. The estimates
 call is separate. `--ceiling` caps a run (requests are counted and returned either way).
 Transcript calls are counted under their own `alpha_vantage_transcripts` key, so

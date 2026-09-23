@@ -6,8 +6,8 @@ forecast; modeling and valuation belong downstream.
 
 ## Read first
 
-- `README.md` — what the library pulls (including up to 12 filing-reported call
-  transcripts a plain pull may acquire), where the data lands, and store guarantees
+- `README.md` — what the library pulls (including the newest call transcripts a plain
+  pull acquires — two by default), where the data lands, and store guarantees
   provides.
 - `tests/run_all.sh` — five offline suites that pin those guarantees; read the
   suite covering the path you are about to change.
@@ -86,12 +86,14 @@ forecast; modeling and valuation belong downstream.
   re-exports it). Import from `financial_data_pull.pull` to reach `SOURCES`,
   `Ceiling`, `scope_key`, or the module itself.
 - **Transcripts derive from reported quarters.** With `alpha_vantage` requested,
-  `transcripts=None` labels up to 12 distinct calendar quarters represented by held
-  SEC filing periods; on a first acquisition, labels come from that run's SEC filings.
+  `transcripts=None` labels the newest 2 distinct calendar quarters represented by
+  held SEC filing periods; on a first acquisition, labels come from that run's SEC
+  filings. Name explicit `YYYYQN` labels to ask for more quarters.
   A source set with no SEC evidence anywhere must provide explicit labels.
   `transcripts=[]` / `--transcripts none` opts out. Held transcript quarters are
-  frozen and never re-asked, including on refresh; new calls are paced 1.5 seconds
-  apart (up to 12 per acquisition).
+  frozen and never re-asked, including on refresh — a serve returns all of them,
+  whatever depth a new acquisition would ask for; new calls are paced 1.5 seconds
+  apart (two per acquisition by default).
 - **Earnings releases are on by default.** `eight_ks=None` with `sec` requests 12
   Item 2.02 releases; `eight_ks=0` opts out. To acquire a different depth, use
   `refresh=True`; changing depth acquires the full requested source set.

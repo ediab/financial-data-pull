@@ -577,7 +577,8 @@ def test_reported_quarters_uses_filing_periods_and_skips_missing_entries():
                 absent={"status": "FAILED"}, nan={"period_of_report": float("nan")})
     expected = ["2023Q4", "2024Q1", "2024Q2", "2024Q3", "2024Q4", "2025Q1",
                 "2025Q2", "2025Q3", "2025Q4", "2026Q1", "2026Q2", "2026Q3"]
-    assert reported_quarters(meta) == expected
+    assert reported_quarters(meta, count=12) == expected
+    assert reported_quarters(meta) == ["2026Q2", "2026Q3"], "the default is the newest two"
     assert reported_quarters({"a": {"period_of_report": "2025-12-31"},
                               "b": {"period_of_report": "2025-03-31"},
                               "duplicate": {"period_of_report": "2025-12-31"}},
@@ -586,7 +587,8 @@ def test_reported_quarters_uses_filing_periods_and_skips_missing_entries():
     vrt = {f"filing_{i}": {"period_of_report": period}
            for i, period in enumerate([*VRT_SHAPE["periods"]["10-K"],
                                        *VRT_SHAPE["periods"]["10-Q"]])}
-    assert reported_quarters(vrt)[-4:] == ["2025Q3", "2025Q4", "2026Q1", "2026Q2"]
+    assert reported_quarters(vrt, count=4) == ["2025Q3", "2025Q4", "2026Q1", "2026Q2"]
+    assert reported_quarters(vrt) == ["2026Q1", "2026Q2"]
 
 
 def test_default_transcripts_without_sec_evidence_require_explicit_labels():
@@ -601,13 +603,12 @@ def test_default_transcripts_without_sec_evidence_require_explicit_labels():
                 raise AssertionError("a transcript scope without SEC evidence must be explicit")
 
 
-def test_a_first_pull_derives_twelve_transcript_quarters_from_its_sec_fetch():
+def test_a_first_pull_derives_the_newest_reported_quarters_from_its_sec_fetch():
     with _TempPlane():
         t, e = _Transcripts(), _EightK()
         with _patched(_Sec(shape=AVGO_SHAPE), _Yahoo(), _Estimates(), e, transcripts=t):
             result = pull("AVGO")
-        expected = ["2023Q4", "2024Q1", "2024Q2", "2024Q3", "2024Q4", "2025Q1",
-                    "2025Q2", "2025Q3", "2025Q4", "2026Q1", "2026Q2", "2026Q3"]
+        expected = ["2026Q2", "2026Q3"]
         assert result["status"] == "RETRIEVED", result
         assert t.quarters == expected, (t.quarters, expected)
         assert result["scope_key"] == scope_key(
@@ -615,7 +616,7 @@ def test_a_first_pull_derives_twelve_transcript_quarters_from_its_sec_fetch():
         assert result["eight_ks"] == 12 and e.counts == [12], (result, e.counts)
         assert result["reported_quarters"] == expected
         assert "av_transcript" in result["table_hashes"], result["table_hashes"]
-        print("  a first pull derives 12 quarters from its own SEC fetch ✓")
+        print("  a first pull derives the newest reported quarters from its own SEC fetch ✓")
 
 
 def test_held_ticker_without_transcripts_serves_and_names_the_absence():
@@ -645,16 +646,26 @@ def test_held_vrt_filing_history_is_served_without_transcript_acquisition():
 
 
 def test_short_sec_history_is_not_padded_and_is_reported():
-    shape = {"periods": {"10-K": ["2025-12-31", "2024-12-31"]},
-             "revenue_label": "Net sales", "equity_concept": "us-gaap_StockholdersEquity"}
+    def shape(years):
+        return {"periods": {"10-K": years},
+                "revenue_label": "Net sales", "equity_concept": "us-gaap_StockholdersEquity"}
     with _TempPlane():
         transcripts = _Transcripts()
-        with _patched(_Sec(shape=shape), _Yahoo(), _Estimates(), transcripts=transcripts):
+        with _patched(_Sec(shape=shape(["2025-12-31", "2024-12-31"])), _Yahoo(),
+                      _Estimates(), transcripts=transcripts):
             result = pull("VRT", sources=["sec", "alpha_vantage"], eight_ks=0)
         assert result["status"] == "RETRIEVED", result
         assert transcripts.quarters == ["2024Q4", "2025Q4"], transcripts.quarters
-        assert result["reported_quarters_note"] == (
-            "2 reported quarter(s) available; scope was not padded"), result
+        assert result["reported_quarters"] == ["2024Q4", "2025Q4"], result
+        assert "reported_quarters_note" not in result, result
+    with _TempPlane():
+        transcripts = _Transcripts()
+        with _patched(_Sec(shape=shape(["2025-12-31"])), _Yahoo(), _Estimates(),
+                      transcripts=transcripts):
+            short = pull("VRT", sources=["sec", "alpha_vantage"], eight_ks=0)
+        assert short["reported_quarters"] == ["2025Q4"], short
+        assert short["reported_quarters_note"] == (
+            "1 reported quarter(s) available; scope was not padded"), short
 
 
 def _fabricate_snapshot(issuer, ticker, run_id, tables, originals=None):
@@ -1736,7 +1747,7 @@ if __name__ == "__main__":
     test_estimate_metadata_names_a_period_field_the_payload_carries()
     test_reported_quarters_uses_filing_periods_and_skips_missing_entries()
     test_default_transcripts_without_sec_evidence_require_explicit_labels()
-    test_a_first_pull_derives_twelve_transcript_quarters_from_its_sec_fetch()
+    test_a_first_pull_derives_the_newest_reported_quarters_from_its_sec_fetch()
     test_held_ticker_without_transcripts_serves_and_names_the_absence()
     test_held_vrt_filing_history_is_served_without_transcript_acquisition()
     test_short_sec_history_is_not_padded_and_is_reported()

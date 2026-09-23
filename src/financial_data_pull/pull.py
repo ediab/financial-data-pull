@@ -41,6 +41,10 @@ RUN_STATUSES = ("MISSING", "FAILED", "RATE_LIMITED", "PARSE_FAILED")
 # how much filing history one acquisition covers (master plan §4 data baseline)
 ANNUAL_FILINGS = 3
 QUARTERLY_FILINGS = 9
+# A derived transcript scope asks for the newest reported quarters only: the latest
+# call is the one a reader needs, and each quarter costs a scarce Alpha Vantage
+# request. The statement history stays 12 filings deep regardless.
+TRANSCRIPT_QUARTERS = 2
 STATEMENT_PREFIXES = ("income_", "balance_", "cashflow_")
 # the source sets a snapshot can be scoped to; a snapshot satisfies only the
 # scope it was acquired for, so each may be refreshed on its own schedule
@@ -60,7 +64,7 @@ POINT_IN_TIME = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 QUARTER_LABEL = re.compile(r"\d{4}Q[1-4]")
 
 
-def reported_quarters(filings_meta: dict, count: int = 12) -> list[str]:
+def reported_quarters(filings_meta: dict, count: int = TRANSCRIPT_QUARTERS) -> list[str]:
     """Return distinct calendar-quarter labels represented by filing period ends.
 
     Missing or invalid period ends are ignored (notably failed filings). The newest
@@ -730,7 +734,7 @@ def pull(ticker: str, *, issuer: str | None = None, sources=None, transcripts=No
     result.setdefault("note", None)
     if derived_transcripts:
         result["reported_quarters"] = transcripts
-        if len(transcripts) < 12:
+        if len(transcripts) < TRANSCRIPT_QUARTERS:
             result["reported_quarters_note"] = (
                 f"{len(transcripts)} reported quarter(s) available; scope was not padded")
     return {**result, "requests": ceiling.used}
