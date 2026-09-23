@@ -38,7 +38,8 @@ logger.addHandler(logging.NullHandler())
 
 RESERVED_COLUMNS = {"concept", "label", "dimension"}
 RUN_STATUSES = ("MISSING", "FAILED", "RATE_LIMITED", "PARSE_FAILED")
-# how much filing history one acquisition covers (master plan §4 data baseline)
+# how much filing history one acquisition covers: 12 reported quarter-ends, the span the
+# statement history, the release archive and the checks are all built around
 ANNUAL_FILINGS = 3
 QUARTERLY_FILINGS = 9
 # A derived transcript scope asks for the newest reported quarters only: the latest

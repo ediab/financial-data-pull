@@ -404,8 +404,8 @@ _real_transcript = alphavantage.earnings_call_transcript
 def _patched(s, y, a, e=None, transcripts=None) -> ExitStack:
     """All providers doubled: no test in this file can reach the network.
 
-    The earnings-call transcript provider is doubled too — a plain pull now derives
-    the last four quarters, so a real call would spend quota. The few tests that
+    The earnings-call transcript provider is doubled too — a plain pull derives the
+    newest two reported quarters, so a real call would spend quota. The few tests that
     exercise the real provider through a patched `urlopen` pass
     `transcripts=_real_transcript`.
     """

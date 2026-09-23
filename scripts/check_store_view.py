@@ -37,7 +37,8 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 
 from financial_data_pull import read_table, store  # noqa: E402
-from financial_data_pull.pull import held_transcript_quarters, manifest  # noqa: E402
+from financial_data_pull.pull import (TRANSCRIPT_QUARTERS, held_transcript_quarters,  # noqa: E402
+                                     manifest)
 
 PERIOD = re.compile(r"^\d{4}-\d{2}-\d{2}")
 QUARTER_MONTH = {3: "Q1", 6: "Q2", 9: "Q3", 12: "Q4"}
@@ -275,15 +276,16 @@ def check_issuer(T):
           f"{eight.filing_date.min()}..{eight.filing_date.max()}, cells {int(n_cells.min()) if len(n_cells) else 0}..{int(n_cells.max()) if len(n_cells) else 0}")
     check(near == len(got), "each release follows its own quarter end by <= 75 days", f"{near}/{len(got)}")
 
-    # ---- transcripts: the newest 4 must be carried, extras are a bonus --------
+    # ---- transcripts: the canonical newest quarters must be carried, extras are a bonus
     tr = read_table(T, "av_transcript")
     carried = sorted(str(q) for q in tr.quarter.unique())
     held = sorted(held_transcript_quarters(T))
-    check(len(carried) >= 4 and consecutive(carried),
+    check(len(carried) >= TRANSCRIPT_QUARTERS and consecutive(carried),
           "latest snapshot carries contiguous transcript quarters",
           f"{carried[0]}..{carried[-1]}" if carried else "none")
-    if set(got[-4:]) - set(carried):
-        warn(f"newest filing quarters without a carried transcript: {sorted(set(got[-4:]) - set(carried))}"
+    if set(got[-TRANSCRIPT_QUARTERS:]) - set(carried):
+        warn(f"newest filing quarters without a carried transcript: "
+             f"{sorted(set(got[-TRANSCRIPT_QUARTERS:]) - set(carried))}"
              f" (transcript scope is calendar quarters, filings are fiscal — pass the labels explicitly to widen)")
     if set(held) - set(carried):
         warn(f"{len(set(held) - set(carried))} held transcript quarter(s) not carried by the latest snapshot: "

@@ -256,7 +256,9 @@ and writes nothing. It answers the consumer's question instead of the library's:
 latest snapshot self-contained (every table readable with no `run_id`), does the balance
 sheet balance and the cash reconcile, does the quarter-building arithmetic tie out
 (`YTD = Σ quarters`, `Q4 = FY − 9M`), and does every quarter's revenue appear in that
-quarter's own earnings release. A derived Q4 that matches the press release to the dollar
+quarter's own earnings release. It also requires the newest snapshot to carry the
+canonical two call transcripts, treating deeper held evidence as a bonus. A derived Q4
+that matches the press release to the dollar
 is the strongest offline proof the tables are right; a quarter that does not match is
 either a parse bug or a period you built from the wrong filing.
 
