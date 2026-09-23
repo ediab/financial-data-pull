@@ -24,6 +24,7 @@ import tempfile
 from pathlib import Path
 
 from lxml import html as lxml_html
+import pandas as pd
 
 from . import contracts, store
 
@@ -570,3 +571,153 @@ def export_views(issuer: str) -> dict[str, int]:
         "documents/transcript": export_transcripts(issuer),
         "8k_cells.csv": export_8k_cells(issuer, verified),
     }
+
+
+_HISTORY_PERIOD = re.compile(r"^(\d{4}-\d{2}-\d{2}) \((Q[1-4]|FY|YTD)\)$")
+_HISTORY_POINT = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_HISTORY_RESERVED = ("concept", "label", "dimension")
+
+
+def build_history(frames: dict[str, pd.DataFrame], family: str) -> pd.DataFrame:
+    """Build one as-filed, quarter-wide history from statement filing frames.
+
+    The newest frame that states a row/quarter wins. Q4 and cash-flow quarters are
+    explicitly marked derived because the filings state annual/YTD values instead.
+    This is a computed view, not a published store table.
+    """
+    if family not in {"income", "balance", "cashflow"}:
+        raise ValueError(f"unknown statement family {family!r}")
+    reserved = tuple(column for column in _HISTORY_RESERVED
+                     if any(column in frame.columns for frame in frames.values()))
+    if not reserved:
+        return pd.DataFrame(columns=[])
+
+    # Keep table index order: _0 is the newest filing, which governs restatements.
+    ordered = sorted(frames.items(), key=lambda pair: (
+        0 if "_quarterly_" in pair[0] else 1,
+        int(pair[0].rsplit("_", 1)[-1]) if pair[0].rsplit("_", 1)[-1].isdigit() else 0,
+        pair[0]))
+    rows: dict[tuple, dict] = {}
+    direct: dict[tuple[str, str], dict[tuple, object]] = {}
+    ytd: dict[tuple[int, int], dict[tuple, object]] = {}
+    owner_ytd: dict[tuple[int, int], dict[tuple, object]] = {}
+    owner_annual: dict[int, dict[tuple, object]] = {}
+    candidates: dict[str, tuple[str, int, int]] = {}
+
+    def row_key(record):
+        return tuple(record.get(column) for column in reserved)
+
+    for name, frame in ordered:
+        is_balance = family == "balance"
+        own_end = next((match.group(1) for column in frame.columns
+                        if (match := _HISTORY_PERIOD.fullmatch(str(column)))), None)
+        for _, record in frame.iterrows():
+            key = row_key(record)
+            rows.setdefault(key, {column: record.get(column) for column in reserved})
+        for column in frame.columns:
+            col = str(column)
+            if col in reserved:
+                continue
+            match = _HISTORY_POINT.fullmatch(col) if is_balance else _HISTORY_PERIOD.fullmatch(col)
+            if not match:
+                continue
+            end = match.group(1) if not is_balance else col
+            if is_balance:
+                year, month = int(end[:4]), int(end[5:7])
+                quarter = (month - 1) // 3 + 1
+                candidates.setdefault(end, (end, year, quarter))
+                dest = direct.setdefault((end, "point"), {})
+            else:
+                kind = match.group(2)
+                year, month = int(end[:4]), int(end[5:7])
+                quarter = (month - 1) // 3 + 1
+                candidates.setdefault(end, (end, year, quarter))
+                if kind.startswith("Q"):
+                    # Income quarter columns are as-filed, including comparative columns.
+                    if family == "income":
+                        dest = direct.setdefault((end, kind), {})
+                        for _, record in frame.iterrows():
+                            dest.setdefault(row_key(record), record.get(col))
+                    continue
+                if kind == "YTD":
+                    dest = ytd.setdefault((year, quarter), {})
+                    for _, record in frame.iterrows():
+                        dest.setdefault(row_key(record), record.get(col))
+                    if end == own_end:
+                        own_dest = owner_ytd.setdefault((year, quarter), {})
+                        for _, record in frame.iterrows():
+                            own_dest.setdefault(row_key(record), record.get(col))
+                elif kind == "FY":
+                    if end == own_end:
+                        own_dest = owner_annual.setdefault(year, {})
+                        for _, record in frame.iterrows():
+                            own_dest.setdefault(row_key(record), record.get(col))
+
+    # The output labels preserve the period column as filed; only derived values gain
+    # a marker. Choose candidate periods from values actually available for the family.
+    if family == "balance":
+        available = {key[0] for key in direct}
+    elif family == "income":
+        available = {end for end, kind in direct if kind.startswith("Q")}
+    else:
+        available = {end for (year, q), vals in ytd.items()
+                     for end, (_, ey, eq) in candidates.items() if (ey, eq) == (year, q)}
+    for year in owner_annual:
+        # Q4 is derivable only when both the year's FY and Q3 YTD are held.
+        q4_ends = [end for end, (_, ey, eq) in candidates.items() if ey == year and eq == 4]
+        q3_ends = [end for end, (_, ey, eq) in candidates.items() if ey == year and eq == 3]
+        if q4_ends and q3_ends and ((year, 3) in owner_ytd or (year, 3) in ytd):
+            available.add(sorted(q4_ends)[-1])
+    selected = sorted(available, reverse=True)[:12]
+    selected.reverse()
+
+    # For flow values, a Q4 is FY less Q3 YTD. Cash-flow Q1..Q3 are changes in
+    # successive as-filed YTD totals, computed separately for each row.
+    values_by_end: dict[str, dict[tuple, object]] = {}
+    labels: dict[str, str] = {}
+    if family == "balance":
+        for end in selected:
+            values_by_end[end] = direct.get((end, "point"), {})
+            labels[end] = end
+    elif family == "income":
+        for end in selected:
+            _, year, quarter = candidates[end]
+            if quarter == 4 and year in owner_annual and ((year, 3) in owner_ytd or (year, 3) in ytd):
+                fy = owner_annual[year]
+                nine = owner_ytd.get((year, 3), ytd[(year, 3)])
+                values_by_end[end] = {key: (fy[key] - nine[key])
+                                      for key in fy.keys() & nine.keys()
+                                      if pd.notna(fy[key]) and pd.notna(nine[key])}
+                labels[end] = f"{end} (Q4 derived)"
+            else:
+                kind = f"Q{quarter}"
+                values_by_end[end] = direct.get((end, kind), {})
+                labels[end] = f"{end} ({kind})"
+    else:
+        for end in selected:
+            _, year, quarter = candidates[end]
+            if quarter == 4 and year in owner_annual and ((year, 3) in owner_ytd or (year, 3) in ytd):
+                fy = owner_annual[year]
+                nine = owner_ytd.get((year, 3), ytd[(year, 3)])
+                values_by_end[end] = {key: fy[key] - nine[key]
+                                      for key in fy.keys() & nine.keys()
+                                      if pd.notna(fy[key]) and pd.notna(nine[key])}
+                labels[end] = f"{end} (Q4 derived)"
+            elif (year, quarter) in ytd:
+                current = ytd[(year, quarter)]
+                prior = ytd.get((year, quarter - 1), {}) if quarter > 1 else {}
+                values_by_end[end] = ({key: current[key] for key in current}
+                                      if quarter == 1 else
+                                      {key: current[key] - prior[key]
+                                       for key in current.keys() & prior.keys()
+                                       if pd.notna(current[key]) and pd.notna(prior[key])})
+                labels[end] = f"{end} (Q{quarter} derived)"
+
+    result = []
+    for key, identity in rows.items():
+        row = dict(identity)
+        for end in selected:
+            row[labels.get(end, end)] = values_by_end.get(end, {}).get(key, float("nan"))
+        result.append(row)
+    columns = [*reserved, *(labels.get(end, end) for end in selected)]
+    return pd.DataFrame(result, columns=columns)

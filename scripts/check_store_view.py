@@ -161,7 +161,9 @@ def check_issuer(T):
 
     csvdir = ROOT / "data" / "csv" / T
     n_csv = len(list(csvdir.glob("*.csv")))
-    check(n_csv == len(tables), "one CSV per table in the latest snapshot", f"{n_csv} vs {len(tables)}")
+    check(n_csv in (len(tables), len(tables) + 3),
+          "one CSV per table, plus histories after export",
+          f"{n_csv} vs {len(tables)} or {len(tables) + 3}")
     if (csvdir / "yahoo_prices.csv").exists():
         hdr = (csvdir / "yahoo_prices.csv").read_text().splitlines()[0]
         check(hdr.startswith("Date,"), "yahoo_prices.csv keeps its Date column", hdr[:58])

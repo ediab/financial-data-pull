@@ -488,6 +488,28 @@ def test_the_sec_fixture_serves_a_twelve_quarter_avgo_history():
     print("  the SEC fixture serves a twelve-quarter AVGO history ✓")
 
 
+def test_statement_histories_are_in_acquired_and_cached_bundles():
+    with _TempPlane():
+        sec_double = _Sec(shape=AVGO_SHAPE)
+        providers = _patched(sec_double, _Yahoo(), _Estimates())
+        with providers:
+            acquired = pull("AVGO", sources=["sec"])
+        for family in ("income", "balance", "cashflow"):
+            name = f"{family}_history"
+            assert name in acquired["tables"], acquired["tables"].keys()
+            assert acquired["provenance"][name] == {"derived": True,
+                                                       "sources": [Path(acquired["snapshot_dir"]).name]}
+            assert name not in acquired["table_hashes"], "history is computed, not published"
+            assert len(acquired["tables"][name].columns) == 15, (name, acquired["tables"][name])
+        with _patched(mock.Mock(side_effect=RuntimeError("provider called")),
+                      mock.Mock(side_effect=RuntimeError("provider called")),
+                      mock.Mock(side_effect=RuntimeError("provider called"))):
+            cached = pull("AVGO", sources=["sec"])
+        assert cached["status"] == "CACHED"
+        assert {"income_history", "balance_history", "cashflow_history"} <= cached["tables"].keys()
+    print("  acquisition and cached bundles carry computed statement histories ✓")
+
+
 def test_the_sec_fixture_serves_a_calendar_year_vrt_history():
     """The VRT shape: calendar quarter ends, so the newest four reported quarters are
     exactly the labels the old calendar rule derived."""
@@ -1341,7 +1363,8 @@ def test_export_reads_only_the_latest_snapshot():
         exported = export_csv("NVDA")
         latest = Path(later["snapshot_dir"]).name
         assert set(exported.values()) == {latest}, exported
-        assert set(exported) == set(later["table_hashes"]), exported
+        assert set(exported) == set(later["table_hashes"]) | {
+            "income_history", "balance_history", "cashflow_history"}, exported
         assert set(everything["table_hashes"]) <= set(later["table_hashes"]), \
             "refresh must fold every held table into the newest snapshot"
         frame = read_table("NVDA", "av_earnings_estimates")
@@ -1405,7 +1428,10 @@ def test_the_cli_export_prints_provenance_and_makes_no_network_call():
             table, _, snapshot_id = line.partition(" ← ")
             snapshot = store.TABLES / "NVDA" / snapshot_id
             manifest_doc = json.loads((snapshot / "snapshot.json").read_text())
-            assert table in manifest_doc["table_hashes"], line
+            if table.endswith("_history"):
+                assert table in {"income_history", "balance_history", "cashflow_history"}, line
+            else:
+                assert table in manifest_doc["table_hashes"], line
         assert (s.calls, y.calls, a.calls) == (0, 0, 0), "the export must touch no provider"
         assert (store.CSV / "NVDA" / "sec_8k.csv").is_file()
         assert e.calls == 1 and e.counts == [2], (e.calls, e.counts)
@@ -1697,6 +1723,7 @@ if __name__ == "__main__":
     test_refresh_refuses_a_tampered_held_table()
     test_held_evidence_filters_sources_transcripts_and_releases()
     test_the_sec_fixture_serves_a_twelve_quarter_avgo_history()
+    test_statement_histories_are_in_acquired_and_cached_bundles()
     test_the_sec_fixture_serves_a_calendar_year_vrt_history()
     test_the_sec_fixture_still_raises_for_a_filing_it_does_not_hold()
     test_estimate_metadata_names_a_period_field_the_payload_carries()

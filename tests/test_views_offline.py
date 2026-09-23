@@ -13,6 +13,7 @@ import csv
 import io
 import itertools
 import json
+import re
 import shutil
 import sys
 from contextlib import ExitStack
@@ -28,8 +29,9 @@ from lxml import html as lxml_html
 from financial_data_pull import store, views
 from financial_data_pull.cli import main
 from financial_data_pull.providers import alphavantage, sec, yahoo
-from financial_data_pull.pull import pull
+from financial_data_pull.pull import _statements_from_sec, export_csv, pull
 
+from test_pull_offline import AVGO_SHAPE, _Sec
 from test_store import _TempPlane
 
 EXHIBIT = """<html><head><meta charset="utf-8"></head><body>
@@ -260,6 +262,61 @@ def _files(root: Path) -> dict[str, str]:
             for p in sorted(root.rglob("*")) if p.is_file()}
 
 
+def test_statement_histories_keep_as_filed_rows_and_derive_quarters():
+    with _TempPlane():
+        sec_double = _Sec(shape=AVGO_SHAPE)
+        with mock.patch.object(sec, "statements", sec_double):
+            frames, _, _ = _statements_from_sec("AVGO", "AVGO", None, store.now_iso())
+        # The latest 10-Q carries a comparative for this quarter and governs the older
+        # filing's own-period value. A separately renamed row exists only where stated.
+        target = "2025-08-03 (Q3)"
+        newest = frames["income_quarterly_0"]
+        newest.loc[0, target] = 12345
+        renamed = newest.iloc[0].copy()
+        renamed["label"] = "Renamed revenue"
+        for column in newest.columns:
+            if column not in ("concept", "label", "dimension", target):
+                renamed[column] = float("nan")
+        newest.loc[len(newest)] = renamed
+        income = views.build_history(
+            {name: frame for name, frame in frames.items() if name.startswith("income_")},
+            "income")
+        assert len(income.columns) == 15, income.columns
+        assert income.iloc[:, :3].columns.tolist() == ["concept", "label", "dimension"]
+        col = next(column for column in income if column.startswith("2025-08-03"))
+        assert income.loc[income.label == "Total net revenue", col].iloc[0] == 12345, income
+        renamed_row = income.loc[income.label == "Renamed revenue"].iloc[0]
+        assert renamed_row[col] == 12345 and renamed_row.drop(labels=["concept", "label", "dimension", col]).isna().all(), renamed_row
+        q4 = [column for column in income if "(Q4 derived)" in column]
+        assert q4 and len(q4) == 3, income.columns
+        cashflow = views.build_history(
+            {name: frame for name, frame in frames.items() if name.startswith("cashflow_")},
+            "cashflow")
+        assert len(cashflow.columns) == 15 and all(
+            column.endswith("derived)") for column in cashflow.columns[3:]), cashflow.columns
+        balance = views.build_history(
+            {name: frame for name, frame in frames.items() if name.startswith("balance_")},
+            "balance")
+        assert all(re.fullmatch(r"\d{4}-\d{2}-\d{2}", column)
+                   for column in balance.columns[3:]), balance.columns
+
+        # CSV histories come from the newest snapshot, and are not manifest tables.
+        with mock.patch.object(sec, "statements", sec_double):
+            acquired = pull("AVGO", sources=["sec"], eight_ks=0)
+        exported = export_csv("AVGO")
+        for family in ("income", "balance", "cashflow"):
+            history_name = f"{family}_history"
+            assert exported[history_name] == Path(acquired["snapshot_dir"]).name
+            with (store.CSV / "AVGO" / f"{history_name}.csv").open(newline="") as fh:
+                header = next(csv.reader(fh))
+            assert len(header) == 15, header
+            if family == "balance":
+                assert all(re.fullmatch(r"\d{4}-\d{2}-\d{2}", col) for col in header[3:]), header
+            else:
+                assert sum("(Q4 derived)" in col for col in header) == 3, header
+    print("  history views preserve filing rows and export derived quarters ✓")
+
+
 def test_the_dump_holds_every_cell_of_every_table_in_the_expected_shape():
     with _TempPlane():
         _stored()
@@ -476,6 +533,7 @@ def test_the_cli_exports_views_offline_and_refuses_acquisition_flags():
 
 
 if __name__ == "__main__":
+    test_statement_histories_keep_as_filed_rows_and_derive_quarters()
     test_the_dump_holds_every_cell_of_every_table_in_the_expected_shape()
     test_documents_carry_readable_names_and_verified_bytes()
     test_a_second_run_writes_nothing_and_a_tampered_original_writes_nothing_at_all()

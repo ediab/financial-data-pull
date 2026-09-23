@@ -27,6 +27,7 @@ import pandas as pd
 
 from . import contracts, store
 from .providers import alphavantage, sec, yahoo  # explicit submodule handles
+from .views import build_history
 
 # The library logs and leaves output to the caller: a NullHandler keeps importable
 # use silent (no last-resort handler writing to stderr), and the CLI configures the
@@ -470,6 +471,7 @@ def pull(ticker: str, *, issuer: str | None = None, sources=None, transcripts=No
         if derived_transcripts:
             scoped_transcripts = reported_quarters(_held_sec_filings(issuer, ticker))
         key = scope_key(issuer, ticker, sources, scoped_transcripts, eight_ks)
+        _add_history_tables(tables, provenance)
         logger.info("CACHED %s: snapshot %s", issuer, snap.name)
         return {"issuer": issuer, "status": "CACHED", "scope_key": key, "tables": tables,
                 "provenance": provenance, "absent": absent,
@@ -703,6 +705,7 @@ def pull(ticker: str, *, issuer: str | None = None, sources=None, transcripts=No
     result.setdefault("tables", tables)
     result.setdefault("provenance", {name: {"snapshot": run_id, "sha256": digest}
                                      for name, digest in result.get("table_hashes", {}).items()})
+    _add_history_tables(result["tables"], result["provenance"])
     result.setdefault("absent", [])
     result.setdefault("snapshot_dirs", [result["snapshot_dir"]]
                        if result.get("snapshot_dir") else [])
@@ -837,6 +840,20 @@ def _publish_snapshot(ticker: str, issuer: str, sources: list[str], transcripts,
             "absent": [], "snapshot_dirs": [str(snap_dir)], "report": None, "note": None}
 
 
+def _add_history_tables(tables: dict, provenance: dict) -> None:
+    """Attach computed statement histories with provenance but no invented parquet hash."""
+    for family in ("income", "balance", "cashflow"):
+        prefix = f"{family}_"
+        frames = {name: frame for name, frame in tables.items() if name.startswith(prefix)}
+        if not frames:
+            continue
+        name = f"{family}_history"
+        tables[name] = build_history(frames, family)
+        snapshots = sorted({entry.get("snapshot") for table, entry in provenance.items()
+                            if table.startswith(prefix) and entry.get("snapshot")})
+        provenance[name] = {"derived": True, "sources": snapshots}
+
+
 def manifest(ticker: str, *, issuer: str | None = None, run_id: str | None = None) -> dict:
     """The manifest of a published snapshot: the pinned `run_id`, else the newest.
 
@@ -899,9 +916,17 @@ def export_csv(issuer: str, out_dir=None) -> dict[str, str]:
             raise ValueError(
                 f"snapshot {snap.name} records the table {table!r} but its parquet "
                 f"is missing — refusing to export a partial snapshot") from exc
+    histories = {}
+    for family in ("income", "balance", "cashflow"):
+        family_frames = {name: frame for name, frame in frames.items()
+                         if name.startswith(f"{family}_")}
+        if family_frames:
+            histories[f"{family}_history"] = build_history(family_frames, family)
     out = Path(out_dir) if out_dir else store.CSV / issuer
     out.mkdir(parents=True, exist_ok=True)
     exported = {table: snap.name for table in frames}
+    exported.update({table: snap.name for table in histories})
+    frames.update(histories)
     for table, frame in frames.items():
         # A named index is data — the dates on prices, the period on the analyst frames —
         # so it becomes a column rather than being dropped by index=False.
