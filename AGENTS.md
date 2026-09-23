@@ -19,7 +19,23 @@ memo and workbook work belongs in the consuming project.
 - **Tests stay offline.** Double `providers.sec.statements`, `providers.sec.earnings_8k`,
   `providers.yahoo.fetch` and `providers.alphavantage.*`, and wrap the store with
   `tests/test_store._TempPlane`, so a suite run touches neither the network nor the
-  repo's `data/`. `bash tests/run_all.sh` runs all four suites.
+  repo's `data/`. `bash tests/run_all.sh` runs all four suites. The opposite check —
+  `scripts/check_store_view.py`, which reads a populated `data/` and nothing else — is
+  deliberately outside the suite.
+- **Statement tables are not uniform across issuers.** `dimension` is a *boolean*: the
+  consolidated line is `False` and segment rows share the concept, so filter it or a
+  segment answers for the company. The consolidated revenue label is "Total revenue"
+  (ANET) or "Net sales" (VRT); the equity total is `StockholdersEquity` (ANET, VRT) or
+  `StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest` (AVGO); the
+  cash-flow ending figure is cash *and restricted cash*, which is not the balance
+  sheet's cash line. Period columns carry the filing's own label — `2026-06-30 (Q2)` for
+  a calendar filer, `2026-08-02 (Q3)` for AVGO — so quarter arithmetic must read the
+  label, never the month.
+- **A later 10-K can round an earlier year.** FY2023 revenue is `5,860,168,000` in the
+  FY2023 10-K and `5,860,200,000` in the FY2025 10-K's comparative column. Derive Q4
+  from the filing that owns the period (FY from that year's 10-K, 9M from that year's
+  Q3 10-Q) or the derived quarter inherits the rounding. `scripts/check_store_view.py`
+  does it that way and ties to the press release exactly.
 - **The store's guarantees are the product.** Atomic publish, immutable snapshots,
   hash-checked reads, and per-dataset status with a reason are what this library is
   for. A change near `save_raw`, `commit_snapshot` or `read_verified_table` earns a

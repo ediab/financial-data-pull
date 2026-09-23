@@ -232,6 +232,22 @@ default scope has newly picked up. When only the documents are wanted, name
 bash tests/run_all.sh     # four suites, all offline: providers are doubled
 ```
 
+`scripts/check_store_view.py` is the other direction — against a real store:
+
+```sh
+.venv/bin/python scripts/check_store_view.py            # every issuer held under data/
+.venv/bin/python scripts/check_store_view.py ANET VRT   # named issuers
+```
+
+It is not part of `run_all.sh` because it needs a populated `data/`; it reads what is held
+and writes nothing. It answers the consumer's question instead of the library's: is the
+latest snapshot self-contained (every table readable with no `run_id`), does the balance
+sheet balance and the cash reconcile, does the quarter-building arithmetic tie out
+(`YTD = Σ quarters`, `Q4 = FY − 9M`), and does every quarter's revenue appear in that
+quarter's own earnings release. A derived Q4 that matches the press release to the dollar
+is the strongest offline proof the tables are right; a quarter that does not match is
+either a parse bug or a period you built from the wrong filing.
+
 ## Out of scope
 
 The model, checks, valuation, delivery, memo, workbooks, Excel recalculation,
