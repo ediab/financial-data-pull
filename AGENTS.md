@@ -35,10 +35,12 @@ memo and workbook work belongs in the consuming project.
   becomes a permanent cache miss and a re-download. (It is the *derived transcript
   quarters* a plain pull now carries that move the default scope, once a quarter —
   see the transcripts gotcha.)
-- **`data/csv/` is derived, never evidence.** `export_csv` takes each table from the
-  newest snapshot that carries it, through the same hash check as `read_table`; a
-  recorded parquet that has vanished refuses the export rather than falling back to
-  an older snapshot. The parquet store stays the source of truth.
+- **`data/csv/` is derived, never evidence.** `export_csv` reads the newest snapshot —
+  the same view `read_table` reads — through the same hash check, verifying every table
+  before it writes the first CSV; a recorded parquet that has vanished refuses the export
+  rather than falling back to an older snapshot. A table the newest snapshot lacks is
+  absent from the export and its stale CSV is removed, so the directory is one version of
+  the evidence rather than a mixture. The parquet store stays the source of truth.
 - **`data/derived/` is derived too, and rewritable.** `views.py` builds the document
   copies, the transcript Markdown and the 8-K cell dump from the snapshots already
   held — under the same hash gating (`read_verified_table`, or the original's sha256

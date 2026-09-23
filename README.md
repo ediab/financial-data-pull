@@ -31,7 +31,7 @@ details.
 ```sh
 .venv/bin/financial-data-pull NVDA                       # every source
 .venv/bin/financial-data-pull NVDA --sources yahoo       # one source set
-.venv/bin/financial-data-pull NVDA --sources sec --refresh
+.venv/bin/financial-data-pull NVDA --refresh                # a new version; warns if thinner
 .venv/bin/financial-data-pull NVDA --cache-only           # zero network
 .venv/bin/financial-data-pull NVDA --ceiling alpha_vantage=10,sec=40
 .venv/bin/financial-data-pull NVDA --earnings-8k 10       # 10 earnings press releases
@@ -68,10 +68,11 @@ export_csv("NVDA")                     # {table: snapshot_id}, writes data/csv/N
 export_views("NVDA")                   # {group: count}, writes data/derived/NVDA/
 ```
 
-To read a table without knowing a `run_id`, prefer the CSVs: `read_table` reads
-only the **newest** snapshot, and a later run that acquired something else (an
-8-K-only pull, say) does not carry that table. `export_csv` picks, per table, the
-newest snapshot that actually holds it.
+To read a table without knowing a `run_id`, read the newest snapshot: `read_table`
+does that, hash-verified. `export_csv` writes the same view as CSVs — one snapshot,
+never a mixture — so a table the newest snapshot does not carry is a loud gap rather
+than a quiet answer from an older version. A pull that leaves the newest snapshot
+thinner than the previous one warns when it publishes.
 
 ## What it pulls
 
@@ -106,9 +107,12 @@ data/derived/<ticker>/8k_cells.csv                     one row per cell of every
 A `run-id` looks like `2026-09-21T145130+0000-fa3741`. A refresh adds a new one.
 
 `--export-csv` writes one CSV per table and prints the snapshot each table came
-from (`income_annual_0 ← 2026-09-21T145130+0000-fa3741`). Each table comes from the
-newest snapshot that retrieved it, so a later run holding only some tables does not
-hide the rest. The CSVs are derived: they can always be rewritten from the
+from (`income_annual_0 ← 2026-09-21T145130+0000-fa3741`). Every table comes from the
+newest snapshot, so the directory holds one version of the evidence and never a
+mixture; a table that snapshot does not carry is absent from the export, and a CSV an
+earlier export left behind is removed. A named index becomes a column of its own — the
+dates on `yahoo_prices`, the period on the analyst frames — because an undated price
+row is not evidence. The CSVs are derived: they can always be rewritten from the
 snapshots, and the snapshots stay the evidence. `av_transcript` content is long
 multi-line quoted text, so open that CSV with a real CSV reader, not by eye.
 
@@ -174,7 +178,10 @@ a hand-written index would.
   The cache key is the issuer, the ticker, the source set, the transcript quarters
   and the 8-K depth, and it contains no date — so the cache never expires on its
   own. Freshness is the explicit `refresh=True`. Because the key is per source set, a
-  daily Yahoo refresh does not re-pull 11 SEC filings. A pull without 8-Ks keeps the
+  daily Yahoo refresh does not re-pull 11 SEC filings. A transcript quarter already held
+  is frozen evidence and is reused rather than re-asked, `refresh=True` included, so the
+  provider is asked once per quarter — and a refresh folds those held quarters into the
+  new snapshot instead of leaving them behind in the old one. A pull without 8-Ks keeps the
   8-K component of its key exactly as it was before the 8-K parameter existed.
 - **The default scope moves once per calendar quarter.** A plain pull derives its
   transcript quarters from today, so the key changes at each rollover: the first plain
