@@ -472,13 +472,30 @@ def pull(ticker: str, *, issuer: str | None = None, sources=None, transcripts=No
             scoped_transcripts = reported_quarters(_held_sec_filings(issuer, ticker))
         key = scope_key(issuer, ticker, sources, scoped_transcripts, eight_ks)
         _add_history_tables(tables, provenance)
+        from .verify import verify_bundle
+        served_snapshots = {entry.get("snapshot") for entry in provenance.values()
+                            if entry.get("snapshot")}
+        recorded_manifest = next((m for _, m in matching
+                                  if m.get("run_id") in served_snapshots
+                                  and m.get("verification")), None)
+        recorded = [m.get("verification") for _, m in matching
+                    if m.get("run_id") in served_snapshots and m.get("verification")]
+        if len(served_snapshots) == 1 and recorded_manifest:
+            report = dict(recorded_manifest["verification"])
+            report["verdict_source"] = "recorded"
+            note = "evidence already held; zero network calls"
+        else:
+            report = verify_bundle(tables, issuer)
+            report["verdict_source"] = "live"
+            if not recorded:
+                report.setdefault("gaps", []).append("verdict not recorded")
+            note = "evidence already held; zero network calls"
         logger.info("CACHED %s: snapshot %s", issuer, snap.name)
         return {"issuer": issuer, "status": "CACHED", "scope_key": key, "tables": tables,
                 "provenance": provenance, "absent": absent,
                 "snapshot_dirs": [str(path) for path, _ in matching],
                 "snapshot_dir": str(snap), "snapshot": held_manifest,
-                "report": None, "note": "evidence already held; zero network calls",
-                "cache_only": cache_only}
+                "report": report, "note": note, "cache_only": cache_only}
     if cache_only:
         logger.info("no snapshot held for ticker %s", ticker)
         return {"status": "MISSING: NOT_RETRIEVED", "issuer": issuer}
@@ -741,6 +758,8 @@ def _publish_snapshot(ticker: str, issuer: str, sources: list[str], transcripts,
     coverage_doc = {"issuer": issuer, "run_id": run_id, "recorded_at": retrieved_at,
                     "rows": rows}
     if not tables:
+        from .verify import verify_bundle
+        report = verify_bundle({}, issuer)
         # no snapshot_id: it names the snapshot that would carry this coverage, and
         # this run published none
         store.atomic_write_json(cov_target, coverage_doc)
@@ -748,7 +767,7 @@ def _publish_snapshot(ticker: str, issuer: str, sources: list[str], transcripts,
                 "coverage_path": str(cov_target), "scope_key": key,
                 "sources": sorted(sources), "transcripts": sorted(transcripts or []),
                 "eight_ks": eight_ks, "tables": {}, "provenance": {}, "absent": [],
-                "snapshot_dirs": [], "report": None, "note": None,
+                "snapshot_dirs": [], "report": report, "note": None,
                 "table_hashes": {}, "statuses": statuses, "open_gaps": gaps}
 
     # Fold every held listing-matching table forward. Reads happen through the
@@ -786,6 +805,22 @@ def _publish_snapshot(ticker: str, issuer: str, sources: list[str], transcripts,
                 seen.update(fresh[identity].dropna())
             publish_tables[name] = pd.concat(kept_frames, ignore_index=True)
 
+    from .verify import verify_bundle
+    own_exhibits = [
+        {"path": filing["exhibit_path"], "accession": filing.get("accession"),
+         "filing_date": filing.get("filing_date", "")}
+        for filing in (provider_meta.get("sec_8k", {}).get("filings") or [])
+        if filing.get("exhibit_path")
+    ]
+    report = verify_bundle(publish_tables, issuer, exhibits=own_exhibits)
+    for row in rows:
+        row["verification"] = report["verdict"]
+    coverage_doc = {"issuer": issuer, "run_id": run_id, "recorded_at": retrieved_at,
+                    "rows": rows}
+    violations = contracts.validate_against(coverage_doc, "coverage")
+    if violations:
+        return {"status": "CONTRACT_VIOLATION", "issuer": issuer, "violations": violations}
+
     # --- stage the snapshot, then publish it atomically ---
     staging = store.staging_dir(issuer, run_id)
     table_hashes: dict[str, str] = {}
@@ -820,6 +855,7 @@ def _publish_snapshot(ticker: str, issuer: str, sources: list[str], transcripts,
         "providers": provider_meta,
         "originals": merged_originals,
         "table_hashes": table_hashes,
+        "verification": report,
         "coverage_path": str(cov_target),
     }
     store.write_snapshot_manifest(staging, manifest)
@@ -837,7 +873,8 @@ def _publish_snapshot(ticker: str, issuer: str, sources: list[str], transcripts,
             "tables": publish_tables,
             "provenance": {name: {"snapshot": run_id, "sha256": digest}
                            for name, digest in table_hashes.items()},
-            "absent": [], "snapshot_dirs": [str(snap_dir)], "report": None, "note": None}
+            "absent": [], "snapshot_dirs": [str(snap_dir)],
+            "report": {**report, "verdict_source": "recorded"}, "note": None}
 
 
 def _add_history_tables(tables: dict, provenance: dict) -> None:

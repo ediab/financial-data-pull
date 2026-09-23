@@ -12,3 +12,5 @@ echo "== Request ceiling (named limits / unnamed counting / transcript breach)"
 "$PY" tests/test_ceiling.py
 echo "== Derived views, offline (documents / transcript Markdown / 8-K cell dump)"
 "$PY" tests/test_views_offline.py
+echo "== Verification report, offline (statement arithmetic / preserved releases)"
+"$PY" tests/test_verify_offline.py
