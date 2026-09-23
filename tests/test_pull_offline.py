@@ -816,26 +816,60 @@ def test_the_cli_refuses_a_sentinel_mixed_with_quarter_labels():
     print("  the CLI refuses a sentinel mixed with quarter labels ✓")
 
 
-def test_export_picks_the_newest_snapshot_carrying_each_table():
+def test_export_reads_only_the_latest_snapshot():
     with _TempPlane():
         s, y, a = _Sec(), _Yahoo(), _Estimates()
         with mock.patch.object(store, "now_iso", _ageing_clock()), _patched(s, y, a):
             everything = pull("NVDA")
-            # a later run that retrieved one table must not hide the earlier ones
-            later = pull("NVDA", sources=["alpha_vantage"])
+            export_csv("NVDA")                                # a complete set first
+            later = pull("NVDA", sources=["alpha_vantage"])  # a thinner latest version
         exported = export_csv("NVDA")
-        assert set(exported) == set(everything["table_hashes"]), exported
-        assert exported["av_earnings_estimates"] == Path(later["snapshot_dir"]).name
-        # the derived default carries the held transcript quarters into the later
-        # snapshot too, so its transcript table also comes from there
-        assert exported["av_transcript"] == Path(later["snapshot_dir"]).name
-        later_tables = {"av_earnings_estimates", "av_transcript"}
-        older = {t: s for t, s in exported.items() if t not in later_tables}
-        assert set(older.values()) == {Path(everything["snapshot_dir"]).name}, older
-        frame = read_table("NVDA", "income_annual_0", run_id=exported["income_annual_0"])
-        csv_path = store.CSV / "NVDA" / "income_annual_0.csv"
+        latest = Path(later["snapshot_dir"]).name
+        assert set(exported.values()) == {latest}, exported
+        assert set(exported) == set(later["table_hashes"]), exported
+        dropped = set(everything["table_hashes"]) - set(later["table_hashes"])
+        assert dropped, "the fixture must leave the later snapshot thinner"
+        for table in sorted(dropped):
+            stale = store.CSV / "NVDA" / f"{table}.csv"
+            assert not stale.exists(), f"{stale} is from an older run: it must not linger"
+        frame = read_table("NVDA", "av_earnings_estimates")
+        csv_path = store.CSV / "NVDA" / "av_earnings_estimates.csv"
         assert csv_path.read_text() == frame.to_csv(index=False), csv_path
-        print("  export takes each table from the newest snapshot that carries it ✓")
+        print("  export reads the latest snapshot only, and prunes what it dropped ✓")
+
+
+def test_export_keeps_a_named_index_as_a_column():
+    """yahoo_prices holds its dates in the index; index=False alone exports them undated."""
+    with _TempPlane():
+        y = _Yahoo()
+        plain = y.__call__
+
+        def dated(ticker, issuer=None, ceiling=None):
+            frames, meta = plain(ticker, issuer, ceiling)
+            index = pd.Index(["2026-09-21", "2026-09-22"], name="Date")
+            return {name: frame.set_index(index) for name, frame in frames.items()}, meta
+
+        with mock.patch.object(store, "now_iso", _ageing_clock()), \
+                _patched(_Sec(), dated, _Estimates()):
+            pull("NVDA")
+        export_csv("NVDA")
+        text = (store.CSV / "NVDA" / "yahoo_prices.csv").read_text()
+        assert text.splitlines()[0].startswith("Date,"), text.splitlines()[0]
+        assert "2026-09-22" in text, text
+        print("  a named index survives the export as its own column ✓")
+
+
+def test_publishing_a_thinner_snapshot_warns():
+    with _TempPlane():
+        with mock.patch.object(store, "now_iso", _ageing_clock()), \
+                _patched(_Sec(), _Yahoo(), _Estimates()):
+            pull("NVDA")
+            with mock.patch.object(pull_logger, "warning") as warn:
+                pull("NVDA", sources=["alpha_vantage"])
+        said = " ".join(str(call.args[0] % call.args[1:]) for call in warn.call_args_list)
+        assert "thinner" in said, said
+        assert "income_annual_0" in said or "yahoo_prices" in said, said
+        print("  a snapshot thinner than the previous latest warns at publish time ✓")
 
 
 def test_the_cli_export_prints_provenance_and_makes_no_network_call():
@@ -874,6 +908,7 @@ def test_eight_k_filings_are_archived_per_filing_and_scoped_by_depth():
         with mock.patch.object(store, "now_iso", _ageing_clock()), \
                 _patched(_Sec(), _Yahoo(), _Estimates(), _EightK(filings)):
             deep = pull("NVDA", eight_ks=3)
+            early = export_csv("NVDA")                      # the deep run is the latest here
             shallow = pull("NVDA", sources=["sec"], eight_ks=1)
             again = pull("NVDA", sources=["sec"], eight_ks=1)
             without = pull("NVDA", sources=["sec"])
@@ -898,9 +933,13 @@ def test_eight_k_filings_are_archived_per_filing_and_scoped_by_depth():
         # depth is part of the scope: a different count is its own acquisition
         assert len({deep["scope_key"], shallow["scope_key"], without["scope_key"]}) == 3
         assert shallow["status"] == "RETRIEVED" and again["status"] == "CACHED", (shallow, again)
-        exported = export_csv("NVDA")
-        assert exported["sec_8k"] == Path(shallow["snapshot_dir"]).name
+        assert early["sec_8k"] == Path(deep["snapshot_dir"]).name, early
         assert (store.CSV / "NVDA" / "sec_8k.csv").is_file()
+        # the newest run asked for no 8-Ks, so the export is the newest run: the CSV from the
+        # earlier one goes rather than being left beside current files as if it were current
+        exported = export_csv("NVDA")
+        assert "sec_8k" not in exported, exported
+        assert not (store.CSV / "NVDA" / "sec_8k.csv").exists(), "a stale export is pruned"
     print("  8-K filings are archived per filing, and a shallower depth is its own scope ✓")
 
 
@@ -1139,7 +1178,9 @@ if __name__ == "__main__":
     test_a_cached_quarter_is_reused_and_the_rest_is_acquired()
     test_the_cli_exits_non_zero_when_nothing_was_published()
     test_the_cli_prints_the_run_status_to_stderr()
-    test_export_picks_the_newest_snapshot_carrying_each_table()
+    test_export_reads_only_the_latest_snapshot()
+    test_export_keeps_a_named_index_as_a_column()
+    test_publishing_a_thinner_snapshot_warns()
     test_the_cli_export_prints_provenance_and_makes_no_network_call()
     test_eight_k_filings_are_archived_per_filing_and_scoped_by_depth()
     test_a_sec_run_with_no_earnings_8k_reports_the_gap()

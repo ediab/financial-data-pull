@@ -645,6 +645,21 @@ def _publish_snapshot(ticker: str, issuer: str, sources: list[str], transcripts,
         df.to_parquet(staging / f"{name}.parquet")
         table_hashes[name] = store.sha256_file(staging / f"{name}.parquet")
 
+    # A snapshot that drops what the previous version carried makes "the latest" a thinner
+    # answer than it was. Say so where it can still be fixed by a full-source pull rather
+    # than letting a reader discover it downstream.
+    previous = store.latest_snapshot_dir(issuer)
+    if previous is not None and previous.name != run_id:
+        carried = set(json.loads((previous / "snapshot.json").read_text())
+                      .get("table_hashes") or {})
+        dropped = sorted(carried - set(table_hashes))
+        if dropped:
+            logger.warning(
+                "this snapshot drops %d table(s) the previous latest %s carried: %s — the "
+                "latest view is now thinner than it was; a full-source pull restores it",
+                len(dropped), previous.name,
+                ", ".join(dropped[:6]) + ("…" if len(dropped) > 6 else ""))
+
     manifest = {
         "issuer": issuer,
         "ticker": ticker,
@@ -706,33 +721,46 @@ def read_table(ticker: str, table: str, *, issuer: str | None = None,
 
 
 def export_csv(issuer: str, out_dir=None) -> dict[str, str]:
-    """One CSV per table, each from the newest snapshot that carries it.
+    """One CSV per table of the latest snapshot — the same view `read_table` reads.
 
-    A table exists in a snapshot only because that run retrieved it, so the newest
-    snapshot carrying a table is the newest good copy — a later run that acquired
-    something else must not hide it. Reads go through the same hash check as any
-    other table read: a mismatched hash, or a recorded file that has vanished, is
-    refused rather than quietly replaced by an older snapshot. Returns
-    {table: snapshot id}; makes no network call.
+    Every CSV in the directory comes from that single snapshot, so an export can never
+    mix versions: a table the latest snapshot does not carry is missing from the export
+    rather than quietly answered from an older run. Into this tool's own directory, a CSV
+    left over from an earlier export of such a table is removed — the directory is derived
+    and rewritable, and a stale file beside current ones invites exactly that misreading.
+    A caller-supplied directory is left alone.
+
+    Reads go through the same hash check as any other table read, and every table is
+    verified before the first CSV is written: a store that lost a byte fails the export
+    instead of leaving a half-written set behind. Returns {table: snapshot id}; no network.
     """
     store.safe_component(issuer, "issuer")
+    snap = store.latest_snapshot_dir(issuer)
+    if snap is None:
+        return {}
+    manifest = json.loads((snap / "snapshot.json").read_text())
+    frames: dict[str, pd.DataFrame] = {}
+    for table in sorted(manifest.get("table_hashes") or {}):
+        try:
+            frames[table] = contracts.read_verified_table(snap, table)
+        except KeyError as exc:
+            # The manifest names this table, so the only KeyError left is the file it
+            # recorded having vanished — corruption, not a snapshot that lacks the table
+            # (a snapshot that lacks it never enters this loop).
+            raise ValueError(
+                f"snapshot {snap.name} records the table {table!r} but its parquet "
+                f"is missing — refusing to export a partial snapshot") from exc
     out = Path(out_dir) if out_dir else store.CSV / issuer
     out.mkdir(parents=True, exist_ok=True)
-    exported: dict[str, str] = {}
-    for snap in reversed(store.snapshot_dirs(issuer)):  # newest first
-        manifest = json.loads((snap / "snapshot.json").read_text())
-        for table in sorted(manifest.get("table_hashes") or {}):
-            if table in exported:
-                continue
-            try:
-                frame = contracts.read_verified_table(snap, table)
-            except KeyError as exc:
-                # The manifest names this table, so the only KeyError left is the file it
-                # recorded having vanished — corruption, not a snapshot that lacks the
-                # table (snapshots lacking it are skipped by their manifest keys above).
-                raise ValueError(
-                    f"snapshot {snap.name} records the table {table!r} but its parquet "
-                    f"is missing — refusing to export a partial snapshot") from exc
-            frame.to_csv(out / f"{table}.csv", index=False, encoding="utf-8")
-            exported[table] = snap.name
+    exported = {table: snap.name for table in frames}
+    for table, frame in frames.items():
+        # A named index is data — the dates on prices, the period on the analyst frames —
+        # so it becomes a column rather than being dropped by index=False.
+        if not isinstance(frame.index, pd.RangeIndex):
+            frame = frame.reset_index()
+        frame.to_csv(out / f"{table}.csv", index=False, encoding="utf-8")
+    if out_dir is None:
+        for stale in sorted(out.glob("*.csv")):
+            if stale.stem not in exported:
+                stale.unlink()
     return exported
