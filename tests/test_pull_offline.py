@@ -641,19 +641,50 @@ def test_held_evidence_serves_transcript_union_without_provider_calls():
     newest = ["2025Q4", "2026Q1", "2026Q2", "2026Q3"]
     with _TempPlane():
         providers = (_Sec(), _Yahoo(), _Estimates(), _EightK(), _Transcripts())
-        with _patched(*providers[:3], providers[3], transcripts=providers[4]):
-            wide = pull("AVGO", sources=["alpha_vantage"], transcripts=quarters)
-            pull("AVGO", sources=["alpha_vantage"], transcripts=newest)
-            calls = tuple(provider.calls for provider in (providers[0], providers[1], providers[2],
-                                                           providers[3], providers[4]))
-            served = pull("AVGO", sources=["alpha_vantage"])
+        newer_run = False
+        original_transcript = providers[4].__call__
+
+        def transcript_with_newer_collision(symbol, quarter, issuer=None, ceiling=None):
+            data, meta = original_transcript(symbol, quarter, issuer, ceiling)
+            if newer_run and quarter == "2025Q4":
+                data["segments"][0]["content"] = "Newer snapshot wins this shared quarter."
+            return data, meta
+
+        with mock.patch.object(store, "now_iso", _ageing_clock()):
+            with _patched(*providers[:3], providers[3], transcripts=transcript_with_newer_collision):
+                wide = pull("AVGO", sources=["alpha_vantage"], transcripts=quarters)
+                newer_run = True
+                # Refresh the overlapping provider evidence so the fixture can make
+                # newest-wins collisions observable instead of reusing held segments.
+                with mock.patch.object(sys.modules["financial_data_pull.pull"],
+                                        "held_transcript_quarters", return_value={}):
+                    narrow = pull("AVGO", sources=["alpha_vantage"], transcripts=newest,
+                                  refresh=True)
+                snapshots = store.snapshot_dirs("AVGO")
+                assert len(snapshots) == 2, snapshots
+                older_id, newer_id = (path.name for path in snapshots)
+                assert older_id == Path(wide["snapshot_dir"]).name
+                assert newer_id == Path(narrow["snapshot_dir"]).name
+                older_table = read_table("AVGO", "av_transcript", run_id=older_id)
+                newer_table = read_table("AVGO", "av_transcript", run_id=newer_id)
+                assert set(older_table["quarter"]) == set(quarters)
+                assert len(older_table["quarter"].unique()) == 10
+                assert set(newer_table["quarter"]) == set(newest)
+                assert len(newer_table["quarter"].unique()) == 4
+                calls = tuple(provider.calls for provider in (providers[0], providers[1], providers[2],
+                                                               providers[3], providers[4]))
+                served = pull("AVGO", sources=["alpha_vantage"])
         assert served["status"] == "CACHED", served
         assert served["tables"]["av_transcript"]["quarter"].nunique() == 10
         assert set(served["tables"]["av_transcript"]["quarter"]) == set(quarters)
         assert tuple(provider.calls for provider in (providers[0], providers[1], providers[2],
                                                      providers[3], providers[4])) == calls
-        assert served["provenance"]["av_transcript"]["snapshot"] == \
-            Path(wide["snapshot_dir"]).name
+        assert served["provenance"]["av_transcript"]["snapshot"] == newer_id
+        served_collision = served["tables"]["av_transcript"].set_index("quarter").loc["2025Q4"]
+        newer_collision = newer_table.set_index("quarter").loc["2025Q4"]
+        older_collision = older_table.set_index("quarter").loc["2025Q4"]
+        assert served_collision["content"] == newer_collision["content"]
+        assert served_collision["content"] != older_collision["content"]
         latest_manifest = manifest("AVGO", run_id=
                                    served["provenance"]["av_transcript"]["snapshot"])
         assert served["provenance"]["av_transcript"]["sha256"] == \
