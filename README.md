@@ -68,7 +68,9 @@ export_views("NVDA")                   # releases/transcripts and 8k_cells.csv
 Every successful `pull` bundle has `tables`, `report`, `provenance`, `absent`,
 `status`, and run/snapshot facts. `tables` contains per-filing datasets plus computed
 `income_history`, `balance_history`, and `cashflow_history` when those families are
-held. `report` contains the verdict (`CHECKED`, `DISCREPANCY`, or `UNCHECKED`), six
+held. Histories keep as-filed row labels and mark a derived Q4 `(Q4 derived)`; when
+only a later filing's restated comparative supplies the 9M, the mark says so
+(`(Q4 derived from comparative)`). `report` contains the verdict (`CHECKED`, `DISCREPANCY`, or `UNCHECKED`), six
 named checks (`balance`, `ytd_sum`, `q4_fy`, `revenue_release`, `cash_reconcile`,
 `quarter_window`), tolerances, identified concepts and gaps; checks never block
 otherwise publishable evidence. `provenance` maps tables to their source snapshot

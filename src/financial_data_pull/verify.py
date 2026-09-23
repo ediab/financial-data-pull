@@ -62,7 +62,15 @@ def _quarter(col):
 
 
 def _own_revenue(tables):
+    """Revenue by reported quarter, own-filing evidence first.
+
+    The prior-year quarter a 10-Q also states is not part of the window, but its YTD
+    is the 9M a fiscal year whose own Q3 10-Q has dropped out of the window derives
+    its Q4 from — the same evidence `views.build_history` uses, so the report and the
+    history agree on how many quarters the record covers.
+    """
     result = {}
+    prior_ytd = {}
     for name in _family(tables, "income_quarterly_"):
         frame = tables[name]
         dated = sorted(c for c in _cols(frame) if "(YTD)" not in c)
@@ -74,6 +82,12 @@ def _own_revenue(tables):
         value = _pick_revenue(frame, col)
         result[q] = {"value": value, "end": end,
                      "ytd": _pick(frame, REVENUE, ytd, REVENUE_LABEL) if ytd else None}
+        for prior in dated[:-1]:
+            prior_q, prior_end = _quarter(prior)
+            prior_col = next((c for c in _cols(frame) if "(YTD)" in c and c[:10] == prior_end), None)
+            amount = _pick(frame, REVENUE, prior_col, REVENUE_LABEL) if prior_col else None
+            if amount is not None:
+                prior_ytd.setdefault(prior_q, amount)
     for name in _family(tables, "income_annual_"):
         frame = tables[name]
         cols = sorted(c for c in _cols(frame) if "(FY)" in c)
@@ -83,6 +97,8 @@ def _own_revenue(tables):
         value = _pick_revenue(frame, col)
         q = f"{col[:4]}Q4"
         prior = result.get(f"{col[:4]}Q3", {}).get("ytd")
+        if prior is None:
+            prior = prior_ytd.get(f"{col[:4]}Q3")
         if value is not None and prior is not None:
             result[q] = {"value": value-prior, "end": col[:10], "ytd": None, "derived": True}
     return result
@@ -226,11 +242,22 @@ def verify_bundle(tables, issuer, exhibits=()) -> dict:
         "; ".join(cash_gaps) if cash_gaps else f"{cash_n} filing checks" if cash_n else "no comparable cash values", bool(cash_n))
 
     dates = sorted({record["end"] for record in revenue.values()})
-    ords = [int(q[:4])*4+int(q[5])-1 for q in sorted(revenue)]
-    day_gaps = [(pd.Timestamp(b)-pd.Timestamp(a)).days for a,b in zip(dates[-12:], dates[-11:])]
-    contiguous = all(b-a == 1 for a,b in zip(ords, ords[1:]))
-    window_ok = len(dates) >= 11 and contiguous and (len(dates) < 12 or all(80 <= d <= 105 for d in day_gaps))
-    window_note = "11 contiguous quarters noted" if len(dates) == 11 else f"{len(dates)} quarter-ends"
+    quarters = sorted(revenue)
+    ords = [int(q[:4])*4+int(q[5])-1 for q in quarters]
+    jumps = [f"{a}..{b}" for a, b, x, y in zip(quarters, quarters[1:], ords, ords[1:]) if y - x != 1]
+    window = dates[-12:]
+    day_gaps = [(pd.Timestamp(b)-pd.Timestamp(a)).days for a, b in zip(window, window[1:])]
+    bad = [f"{a}..{b} ({d}d)" for a, b, d in zip(window, window[1:], day_gaps)
+           if not 80 <= d <= 105]
+    window_ok = len(dates) >= 11 and not jumps and not bad
+    if jumps:
+        window_note = f"missing quarter(s) between {jumps[0]}"
+    elif bad:
+        window_note = f"out-of-tolerance gap {bad[0]}"
+    elif len(dates) == 11:
+        window_note = "11 contiguous quarters noted"
+    else:
+        window_note = f"{len(dates)} quarter-ends"
     add("quarter_window", "12 contiguous quarter-ends; 80–105 day gaps (11 noted)", window_ok, window_note, bool(dates))
 
     failures = any(not check["ok"] and applicability[check["name"]]

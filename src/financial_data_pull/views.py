@@ -687,10 +687,11 @@ def build_history(frames: dict[str, pd.DataFrame], family: str) -> pd.DataFrame:
             if quarter == 4 and year in owner_annual and ((year, 3) in owner_ytd or (year, 3) in ytd):
                 fy = owner_annual[year]
                 nine = owner_ytd.get((year, 3), ytd[(year, 3)])
+                marker = "Q4 derived" if (year, 3) in owner_ytd else "Q4 derived from comparative"
                 values_by_end[end] = {key: (fy[key] - nine[key])
                                       for key in fy.keys() & nine.keys()
                                       if pd.notna(fy[key]) and pd.notna(nine[key])}
-                labels[end] = f"{end} (Q4 derived)"
+                labels[end] = f"{end} ({marker})"
             else:
                 kind = f"Q{quarter}"
                 values_by_end[end] = direct.get((end, kind), {})
@@ -701,10 +702,11 @@ def build_history(frames: dict[str, pd.DataFrame], family: str) -> pd.DataFrame:
             if quarter == 4 and year in owner_annual and ((year, 3) in owner_ytd or (year, 3) in ytd):
                 fy = owner_annual[year]
                 nine = owner_ytd.get((year, 3), ytd[(year, 3)])
+                marker = "Q4 derived" if (year, 3) in owner_ytd else "Q4 derived from comparative"
                 values_by_end[end] = {key: fy[key] - nine[key]
                                       for key in fy.keys() & nine.keys()
                                       if pd.notna(fy[key]) and pd.notna(nine[key])}
-                labels[end] = f"{end} (Q4 derived)"
+                labels[end] = f"{end} ({marker})"
             elif direct.get((end, f"Q{quarter}")):
                 values_by_end[end] = direct[(end, f"Q{quarter}")]
                 labels[end] = f"{end} (Q{quarter})"

@@ -287,13 +287,15 @@ def test_statement_histories_keep_as_filed_rows_and_derive_quarters():
         assert income.loc[income.label == "Total net revenue", col].iloc[0] == 12345, income
         renamed_row = income.loc[income.label == "Renamed revenue"].iloc[0]
         assert renamed_row[col] == 12345 and renamed_row.drop(labels=["concept", "label", "dimension", col]).isna().all(), renamed_row
-        q4 = [column for column in income if "(Q4 derived)" in column]
+        q4 = [column for column in income if "(Q4 derived" in column]
         assert q4 and len(q4) == 3, income.columns
+        comparative = [column for column in q4 if "comparative" in column]
+        assert len(comparative) == 1 and comparative[0].startswith("2023-10-29"), q4
         cashflow = views.build_history(
             {name: frame for name, frame in frames.items() if name.startswith("cashflow_")},
             "cashflow")
         assert len(cashflow.columns) == 15 and all(
-            column.endswith("derived)") for column in cashflow.columns[3:]), cashflow.columns
+            "derived" in column for column in cashflow.columns[3:]), cashflow.columns
         assert [column[:10] for column in cashflow.columns[3:]] == [
             column[:10] for column in income.columns[3:]], (cashflow.columns, income.columns)
         balance = views.build_history(
@@ -315,7 +317,8 @@ def test_statement_histories_keep_as_filed_rows_and_derive_quarters():
             if family == "balance":
                 assert all(re.fullmatch(r"\d{4}-\d{2}-\d{2}", col) for col in header[3:]), header
             else:
-                assert sum("(Q4 derived)" in col for col in header) == 3, header
+                assert sum("(Q4 derived" in col for col in header) == 3, header
+                assert sum("comparative" in col for col in header) == 1, header
     print("  history views preserve filing rows and export derived quarters ✓")
 
 

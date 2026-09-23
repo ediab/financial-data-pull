@@ -34,8 +34,10 @@ forecast; modeling and valuation belong downstream.
 - **A later 10-K can round an earlier year.** FY2023 revenue is `5,860,168,000` in the
   FY2023 10-K and `5,860,200,000` in the FY2025 10-K's comparative column. Derive Q4
   from the filing that owns the period (FY from that year's 10-K, 9M from that year's
-  Q3 10-Q) or the derived quarter inherits the rounding. `scripts/check_store_view.py`
-  does it that way and ties to the press release exactly.
+  Q3 10-Q) or the derived quarter inherits the rounding. A Q4 whose 9M only a later
+  filing's restated comparative supplies is still derived, and the history marks that
+  column `(Q4 derived from comparative)` so the provenance is visible.
+  `scripts/check_store_view.py` does it that way and ties to the press release exactly.
 - **The store's guarantees are the product.** Atomic publish, immutable snapshots,
   hash-checked reads, and per-dataset status with a reason are what this library is
   for. A change near `save_raw`, `commit_snapshot` or `read_verified_table` earns a
