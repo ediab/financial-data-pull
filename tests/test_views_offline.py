@@ -294,6 +294,8 @@ def test_statement_histories_keep_as_filed_rows_and_derive_quarters():
             "cashflow")
         assert len(cashflow.columns) == 15 and all(
             column.endswith("derived)") for column in cashflow.columns[3:]), cashflow.columns
+        assert [column[:10] for column in cashflow.columns[3:]] == [
+            column[:10] for column in income.columns[3:]], (cashflow.columns, income.columns)
         balance = views.build_history(
             {name: frame for name, frame in frames.items() if name.startswith("balance_")},
             "balance")
@@ -315,6 +317,20 @@ def test_statement_histories_keep_as_filed_rows_and_derive_quarters():
             else:
                 assert sum("(Q4 derived)" in col for col in header) == 3, header
     print("  history views preserve filing rows and export derived quarters ✓")
+
+
+def test_cashflow_history_keeps_an_as_filed_quarter_without_ytd():
+    frame = pd.DataFrame({
+        "concept": ["us-gaap_NetCashProvidedByUsedInOperatingActivities"],
+        "label": ["Net cash from operating activities"],
+        "dimension": [False],
+        "2026-02-01 (Q1)": [125.0],
+    })
+    history = views.build_history({"cashflow_quarterly_0": frame}, "cashflow")
+    assert history.columns.tolist() == [
+        "concept", "label", "dimension", "2026-02-01 (Q1)"]
+    assert history.iloc[0, 3] == 125.0
+    print("  cash-flow standalone quarter is preserved as filed ✓")
 
 
 def test_the_dump_holds_every_cell_of_every_table_in_the_expected_shape():
@@ -534,6 +550,7 @@ def test_the_cli_exports_views_offline_and_refuses_acquisition_flags():
 
 if __name__ == "__main__":
     test_statement_histories_keep_as_filed_rows_and_derive_quarters()
+    test_cashflow_history_keeps_an_as_filed_quarter_without_ytd()
     test_the_dump_holds_every_cell_of_every_table_in_the_expected_shape()
     test_documents_carry_readable_names_and_verified_bytes()
     test_a_second_run_writes_nothing_and_a_tampered_original_writes_nothing_at_all()

@@ -579,10 +579,11 @@ _HISTORY_RESERVED = ("concept", "label", "dimension")
 
 
 def build_history(frames: dict[str, pd.DataFrame], family: str) -> pd.DataFrame:
-    """Build one as-filed, quarter-wide history from statement filing frames.
+    """Build one quarter-wide history from statement filing frames.
 
-    The newest frame that states a row/quarter wins. Q4 and cash-flow quarters are
-    explicitly marked derived because the filings state annual/YTD values instead.
+    The newest frame that states a row/quarter wins. Columns mix filed labels and
+    derived labels according to how each value was obtained: standalone (Qn) values
+    keep their filed labels, while Q4 and cash-flow differences are marked derived.
     This is a computed view, not a published store table.
     """
     if family not in {"income", "balance", "cashflow"}:
@@ -633,11 +634,10 @@ def build_history(frames: dict[str, pd.DataFrame], family: str) -> pd.DataFrame:
                 quarter = (month - 1) // 3 + 1
                 candidates.setdefault(end, (end, year, quarter))
                 if kind.startswith("Q"):
-                    # Income quarter columns are as-filed, including comparative columns.
-                    if family == "income":
-                        dest = direct.setdefault((end, kind), {})
-                        for _, record in frame.iterrows():
-                            dest.setdefault(row_key(record), record.get(col))
+                    # A standalone quarterly value is the best evidence for either flow.
+                    dest = direct.setdefault((end, kind), {})
+                    for _, record in frame.iterrows():
+                        dest.setdefault(row_key(record), record.get(col))
                     continue
                 if kind == "YTD":
                     dest = ytd.setdefault((year, quarter), {})
@@ -660,8 +660,10 @@ def build_history(frames: dict[str, pd.DataFrame], family: str) -> pd.DataFrame:
     elif family == "income":
         available = {end for end, kind in direct if kind.startswith("Q")}
     else:
-        available = {end for (year, q), vals in ytd.items()
-                     for end, (_, ey, eq) in candidates.items() if (ey, eq) == (year, q)}
+        available = {end for end, kind in direct if kind.startswith("Q")}
+        available.update(end for (year, q) in ytd
+                         for end, (_, ey, eq) in candidates.items()
+                         if (ey, eq) == (year, q))
     for year in owner_annual:
         # Q4 is derivable only when both the year's FY and Q3 YTD are held.
         q4_ends = [end for end, (_, ey, eq) in candidates.items() if ey == year and eq == 4]
@@ -703,6 +705,9 @@ def build_history(frames: dict[str, pd.DataFrame], family: str) -> pd.DataFrame:
                                       for key in fy.keys() & nine.keys()
                                       if pd.notna(fy[key]) and pd.notna(nine[key])}
                 labels[end] = f"{end} (Q4 derived)"
+            elif direct.get((end, f"Q{quarter}")):
+                values_by_end[end] = direct[(end, f"Q{quarter}")]
+                labels[end] = f"{end} (Q{quarter})"
             elif (year, quarter) in ytd:
                 current = ytd[(year, quarter)]
                 prior = ytd.get((year, quarter - 1), {}) if quarter > 1 else {}
