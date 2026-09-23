@@ -635,45 +635,53 @@ def test_short_sec_history_is_not_padded_and_is_reported():
             "2 reported quarter(s) available; scope was not padded"), result
 
 
+def _fabricate_snapshot(issuer, ticker, run_id, tables, originals=None):
+    staging = store.staging_dir(issuer, run_id)
+    hashes = {}
+    for name, frame in tables.items():
+        path = staging / f"{name}.parquet"
+        frame.to_parquet(path)
+        hashes[name] = store.sha256_file(path)
+    store.write_snapshot_manifest(staging, {
+        "issuer": issuer, "ticker": ticker, "run_id": run_id,
+        "table_hashes": hashes, "originals": originals or {},
+    })
+    return store.commit_snapshot(staging, run_id)
+
+
 def test_held_evidence_serves_transcript_union_without_provider_calls():
     quarters = ["2024Q2", "2024Q3", "2024Q4"] + [
         f"2025Q{i}" for i in range(1, 5)] + ["2026Q1", "2026Q2", "2026Q3"]
     newest = ["2025Q4", "2026Q1", "2026Q2", "2026Q3"]
     with _TempPlane():
         providers = (_Sec(), _Yahoo(), _Estimates(), _EightK(), _Transcripts())
-        newer_run = False
-        original_transcript = providers[4].__call__
-
-        def transcript_with_newer_collision(symbol, quarter, issuer=None, ceiling=None):
-            data, meta = original_transcript(symbol, quarter, issuer, ceiling)
-            if newer_run and quarter == "2025Q4":
-                data["segments"][0]["content"] = "Newer snapshot wins this shared quarter."
-            return data, meta
-
-        with mock.patch.object(store, "now_iso", _ageing_clock()):
-            with _patched(*providers[:3], providers[3], transcripts=transcript_with_newer_collision):
-                wide = pull("AVGO", sources=["alpha_vantage"], transcripts=quarters)
-                newer_run = True
-                # Refresh the overlapping provider evidence so the fixture can make
-                # newest-wins collisions observable instead of reusing held segments.
-                with mock.patch.object(sys.modules["financial_data_pull.pull"],
-                                        "held_transcript_quarters", return_value={}):
-                    narrow = pull("AVGO", sources=["alpha_vantage"], transcripts=newest,
-                                  refresh=True)
-                snapshots = store.snapshot_dirs("AVGO")
-                assert len(snapshots) == 2, snapshots
-                older_id, newer_id = (path.name for path in snapshots)
-                assert older_id == Path(wide["snapshot_dir"]).name
-                assert newer_id == Path(narrow["snapshot_dir"]).name
-                older_table = read_table("AVGO", "av_transcript", run_id=older_id)
-                newer_table = read_table("AVGO", "av_transcript", run_id=newer_id)
-                assert set(older_table["quarter"]) == set(quarters)
-                assert len(older_table["quarter"].unique()) == 10
-                assert set(newer_table["quarter"]) == set(newest)
-                assert len(newer_table["quarter"].unique()) == 4
-                calls = tuple(provider.calls for provider in (providers[0], providers[1], providers[2],
-                                                               providers[3], providers[4]))
-                served = pull("AVGO", sources=["alpha_vantage"])
+        older_id = "2026-09-21T140000+0000-older"
+        newer_id = "2026-09-21T140001+0000-newer"
+        old_rows = [{"quarter": quarter, "segment": 0, "speaker": "Operator",
+                     "title": "Operator", "content": f"older {quarter}"}
+                    for quarter in quarters]
+        new_rows = [{"quarter": quarter, "segment": 0, "speaker": "Operator",
+                     "title": "Operator", "content": (
+                         "Newer snapshot wins this shared quarter." if quarter == "2025Q4"
+                         else f"newer {quarter}")}
+                    for quarter in newest]
+        _fabricate_snapshot("AVGO", "AVGO", older_id,
+                            {"av_transcript": pd.DataFrame(old_rows)})
+        _fabricate_snapshot("AVGO", "AVGO", newer_id,
+                            {"av_transcript": pd.DataFrame(new_rows)})
+        with _patched(*providers[:3], providers[3], transcripts=providers[4]):
+            snapshots = store.snapshot_dirs("AVGO")
+            assert len(snapshots) == 2, snapshots
+            assert [path.name for path in snapshots] == [older_id, newer_id]
+            older_table = read_table("AVGO", "av_transcript", run_id=older_id)
+            newer_table = read_table("AVGO", "av_transcript", run_id=newer_id)
+            assert set(older_table["quarter"]) == set(quarters)
+            assert len(older_table["quarter"].unique()) == 10
+            assert set(newer_table["quarter"]) == set(newest)
+            assert len(newer_table["quarter"].unique()) == 4
+            calls = tuple(provider.calls for provider in (providers[0], providers[1], providers[2],
+                                                           providers[3], providers[4]))
+            served = pull("AVGO", sources=["alpha_vantage"])
         assert served["status"] == "CACHED", served
         assert served["tables"]["av_transcript"]["quarter"].nunique() == 10
         assert set(served["tables"]["av_transcript"]["quarter"]) == set(quarters)
@@ -693,6 +701,86 @@ def test_held_evidence_serves_transcript_union_without_provider_calls():
         assert {"status", "issuer", "tables", "provenance", "absent", "snapshot_dirs",
                 "report", "note"} <= served.keys()
     print("  held transcript union serves offline with provenance ✓")
+
+
+def test_refresh_folds_forward_verified_tables_rows_originals_and_request_scope():
+    issuer = "AVGO"
+    old_id = "2026-09-20T000000+0000-wide"
+    quarters = ["2026Q2", "2026Q3"]
+    old_transcript = pd.DataFrame([
+        {"quarter": q, "segment": 0, "speaker": "Operator", "title": "Operator",
+         "content": f"old {q}"} for q in quarters])
+    old_releases = pd.DataFrame([
+        {"ticker": "AVGO", "filing_date": "2025-02-06",
+         "accession": "0000000000-25-000010", "items": "2.02",
+         "exhibit_file": "old.htm", "exhibit_path": "old-path"},
+        {"ticker": "AVGO", "filing_date": "2024-10-30",
+         "accession": "0000000000-24-000011", "items": "2.02",
+         "exhibit_file": "older.htm", "exhibit_path": "older-path"},
+    ])
+    with _TempPlane():
+        old_payload = store.save_raw(issuer, "fixture", b"older original")
+        old_originals = {"old_filing": str(old_payload)}
+        old_snapshot = _fabricate_snapshot(issuer, issuer, old_id, {
+            "income_annual_0": pd.DataFrame({"Value": [1]}),
+            "yahoo_prices": pd.DataFrame({"Close": [10]}),
+            "av_transcript": old_transcript,
+            "sec_8k": old_releases,
+        }, old_originals)
+        for table in ("income_annual_0", "yahoo_prices", "av_transcript", "sec_8k"):
+            contracts.read_verified_table(old_snapshot, table)
+        providers = (_Sec(), _Yahoo(), _Estimates(), _EightK(), _Transcripts())
+        with _patched(*providers[:3], providers[3], transcripts=providers[4]):
+            result = pull(issuer, sources=["sec", "alpha_vantage"],
+                          transcripts=["2026Q2", "2026Q3"], eight_ks=1, refresh=True)
+        assert result["status"] == "RETRIEVED", result
+        assert len(store.snapshot_dirs(issuer)) == 2
+        latest = Path(result["snapshot_dir"])
+        published = manifest(issuer, run_id=latest.name)
+        assert published["sources"] == ["alpha_vantage", "sec"]
+        assert published["transcripts"] == ["2026Q2", "2026Q3"]
+        assert published["eight_ks"] == 1
+        assert {"income_annual_0", "yahoo_prices", "av_transcript", "sec_8k"} <= \
+            set(published["table_hashes"])
+        assert published["originals"]["old_filing"] == str(old_payload)
+        for key, payload in published["originals"].items():
+            path = Path(payload)
+            assert path.is_file(), (key, payload)
+            assert store.sha256_file(path) == path.parent.name, (key, payload)
+        transcript = read_table(issuer, "av_transcript", run_id=latest.name)
+        assert set(transcript["quarter"]) == set(quarters)
+        assert transcript.set_index("quarter").loc["2026Q3", "content"] == \
+            "Welcome to the call."
+        releases = read_table(issuer, "sec_8k", run_id=latest.name)
+        assert releases["accession"].is_unique
+        assert "0000000000-24-000011" in set(releases["accession"])
+        assert releases.set_index("accession").loc[
+            "0000000000-25-000010", "exhibit_file"] == \
+            "ex99-0000000000-25-000010.htm"
+        exported = export_csv(issuer)
+        assert set(published["table_hashes"]) <= set(exported)
+        assert "income_annual_0" in exported and "yahoo_prices" in exported
+    print("  refresh folds forward verified evidence and exports the full snapshot ✓")
+
+
+def test_refresh_refuses_a_tampered_held_table():
+    issuer = "AVGO"
+    old_id = "2026-09-20T000000+0000-tampered"
+    with _TempPlane():
+        snap = _fabricate_snapshot(issuer, issuer, old_id,
+                                   {"held_only": pd.DataFrame({"Value": [1]})})
+        with (snap / "held_only.parquet").open("ab") as fh:
+            fh.write(b"tamper")
+        with _patched(_Sec(), _Yahoo(), _Estimates(), transcripts=_Transcripts()):
+            try:
+                pull(issuer, sources=["alpha_vantage"], transcripts=["2026Q3"],
+                     refresh=True)
+            except ValueError as exc:
+                assert "hash mismatch" in str(exc), exc
+            else:
+                raise AssertionError("refresh published a tampered held table")
+        assert [path.name for path in store.snapshot_dirs(issuer)] == [old_id]
+    print("  refresh refuses a tampered carried table ✓")
 
 
 def test_held_evidence_filters_sources_transcripts_and_releases():
@@ -1249,20 +1337,17 @@ def test_export_reads_only_the_latest_snapshot():
         with mock.patch.object(store, "now_iso", _ageing_clock()), _patched(s, y, a):
             everything = pull("NVDA")
             export_csv("NVDA")                                # a complete set first
-            later = pull("NVDA", sources=["alpha_vantage"], refresh=True)  # a thinner latest version
+            later = pull("NVDA", sources=["alpha_vantage"], refresh=True)
         exported = export_csv("NVDA")
         latest = Path(later["snapshot_dir"]).name
         assert set(exported.values()) == {latest}, exported
         assert set(exported) == set(later["table_hashes"]), exported
-        dropped = set(everything["table_hashes"]) - set(later["table_hashes"])
-        assert dropped, "the fixture must leave the later snapshot thinner"
-        for table in sorted(dropped):
-            stale = store.CSV / "NVDA" / f"{table}.csv"
-            assert not stale.exists(), f"{stale} is from an older run: it must not linger"
+        assert set(everything["table_hashes"]) <= set(later["table_hashes"]), \
+            "refresh must fold every held table into the newest snapshot"
         frame = read_table("NVDA", "av_earnings_estimates")
         csv_path = store.CSV / "NVDA" / "av_earnings_estimates.csv"
         assert csv_path.read_text() == frame.to_csv(index=False), csv_path
-        print("  export reads the latest snapshot only, and prunes what it dropped ✓")
+        print("  export reads the newest snapshot with folded-forward history ✓")
 
 
 def test_export_keeps_a_named_index_as_a_column():
@@ -1291,12 +1376,15 @@ def test_publishing_a_thinner_snapshot_warns():
         with mock.patch.object(store, "now_iso", _ageing_clock()), \
                 _patched(_Sec(), _Yahoo(), _Estimates()):
             pull("NVDA")
-            with mock.patch.object(pull_logger, "warning") as warn:
-                pull("NVDA", sources=["alpha_vantage"], refresh=True)
+            with mock.patch.object(sys.modules["financial_data_pull.pull"],
+                                    "_matching_snapshots", return_value=[]), \
+                    mock.patch.object(pull_logger, "warning") as warn:
+                pull("NVDA", sources=["alpha_vantage"], transcripts=["2026Q1"],
+                     refresh=True)
         said = " ".join(str(call.args[0] % call.args[1:]) for call in warn.call_args_list)
         assert "thinner" in said, said
         assert "income_annual_0" in said or "yahoo_prices" in said, said
-        print("  a snapshot thinner than the previous latest warns at publish time ✓")
+        print("  the thin-snapshot warning remains a safety net ✓")
 
 
 def test_the_cli_export_prints_provenance_and_makes_no_network_call():
@@ -1605,6 +1693,8 @@ def test_a_cache_only_hit_logs_cached_and_nothing_else():
 
 if __name__ == "__main__":
     test_held_evidence_serves_transcript_union_without_provider_calls()
+    test_refresh_folds_forward_verified_tables_rows_originals_and_request_scope()
+    test_refresh_refuses_a_tampered_held_table()
     test_held_evidence_filters_sources_transcripts_and_releases()
     test_the_sec_fixture_serves_a_twelve_quarter_avgo_history()
     test_the_sec_fixture_serves_a_calendar_year_vrt_history()

@@ -748,10 +748,45 @@ def _publish_snapshot(ticker: str, issuer: str, sources: list[str], transcripts,
                 "snapshot_dirs": [], "report": None, "note": None,
                 "table_hashes": {}, "statuses": statuses, "open_gaps": gaps}
 
+    # Fold every held listing-matching table forward. Reads happen through the
+    # manifest hash gate before any old evidence is copied into the new snapshot.
+    publish_tables = dict(tables)
+    merged_originals = dict(originals)
+    transcript_rows = [tables["av_transcript"]] if "av_transcript" in tables else []
+    release_rows = [tables["sec_8k"]] if "sec_8k" in tables else []
+    for held_dir, held_manifest in _matching_snapshots(issuer, ticker):
+        for name, payload in (held_manifest.get("originals") or {}).items():
+            if name not in merged_originals and payload and Path(payload).is_file():
+                merged_originals[name] = payload
+        for name in held_manifest.get("table_hashes", {}):
+            if name in ("av_transcript", "sec_8k"):
+                held_table = contracts.read_verified_table(held_dir, name)
+                (transcript_rows if name == "av_transcript" else release_rows).append(held_table)
+            elif name not in publish_tables:
+                publish_tables[name] = contracts.read_verified_table(held_dir, name)
+
+    # Prefer the first source for a quarter/accession, while retaining every row
+    # belonging to that identity (a transcript quarter has one row per segment).
+    for name, frames, identity in (
+            ("av_transcript", transcript_rows, "quarter"),
+            ("sec_8k", release_rows, "accession")):
+        if frames:
+            kept_frames = []
+            seen = set()
+            for frame in frames:
+                if identity not in frame.columns:
+                    kept_frames.append(frame)
+                    continue
+                keys = frame[identity]
+                fresh = frame[keys.isna() | ~keys.isin(seen)]
+                kept_frames.append(fresh)
+                seen.update(fresh[identity].dropna())
+            publish_tables[name] = pd.concat(kept_frames, ignore_index=True)
+
     # --- stage the snapshot, then publish it atomically ---
     staging = store.staging_dir(issuer, run_id)
     table_hashes: dict[str, str] = {}
-    for name, df in tables.items():
+    for name, df in publish_tables.items():
         df.to_parquet(staging / f"{name}.parquet")
         table_hashes[name] = store.sha256_file(staging / f"{name}.parquet")
 
@@ -780,7 +815,7 @@ def _publish_snapshot(ticker: str, issuer: str, sources: list[str], transcripts,
         "scope_key": key,
         "retrieved_at": retrieved_at,
         "providers": provider_meta,
-        "originals": originals,
+        "originals": merged_originals,
         "table_hashes": table_hashes,
         "coverage_path": str(cov_target),
     }
@@ -796,7 +831,7 @@ def _publish_snapshot(ticker: str, issuer: str, sources: list[str], transcripts,
             "sources": sorted(sources), "transcripts": sorted(transcripts or []),
             "eight_ks": eight_ks,
             "table_hashes": table_hashes, "statuses": statuses, "open_gaps": gaps,
-            "tables": tables,
+            "tables": publish_tables,
             "provenance": {name: {"snapshot": run_id, "sha256": digest}
                            for name, digest in table_hashes.items()},
             "absent": [], "snapshot_dirs": [str(snap_dir)], "report": None, "note": None}
