@@ -7,10 +7,10 @@ renamed into place, so a crash cannot leave a half-written snapshot that a
 cache-only read would trust. Coverage rows report what was actually fetched — never
 a hardcoded period claim — and are validated before they are published.
 
-A plain run is cache-first: a snapshot already held for the same scope is
-returned with zero network calls, and fresher data is an explicit `refresh`.
-The scope key carries no date, so the cache never expires on its own — the
-caller controls freshness.
+A plain run serves the verified union of published snapshots for the requested
+ ticker with zero network calls; request filters shape the bundle. `refresh=True`
+is the explicit acquisition path. Scope keys remain recorded per acquisition but
+do not limit what a held ticker can serve.
 """
 from __future__ import annotations
 
@@ -78,22 +78,106 @@ def reported_quarters(filings_meta: dict, count: int = 12) -> list[str]:
     return sorted(labels, reverse=True)[:count][::-1]
 
 
-def _held_sec_filings(issuer: str, ticker: str) -> dict:
-    """The newest ticker-matching published SEC filing metadata, if any."""
+def _matching_snapshots(issuer: str, ticker: str) -> list[tuple[Path, dict]]:
+    """Published snapshots for exactly this listing, newest first."""
+    matches = []
     for snap in reversed(store.snapshot_dirs(issuer)):
-        manifest_path = snap / "snapshot.json"
-        if not manifest_path.is_file():
-            continue
         try:
-            held_manifest = json.loads(manifest_path.read_text())
+            held_manifest = json.loads((snap / "snapshot.json").read_text())
         except (json.JSONDecodeError, OSError):
             continue
-        if held_manifest.get("ticker") != ticker:
-            continue
+        if held_manifest.get("ticker") == ticker:
+            matches.append((snap, held_manifest))
+    return matches
+
+
+def _held_sec_filings(issuer: str, ticker: str) -> dict:
+    """Union ticker-matching SEC filing metadata, newest snapshot wins collisions."""
+    held = {}
+    for _snap, held_manifest in _matching_snapshots(issuer, ticker):
         filings = ((held_manifest.get("providers") or {}).get("sec") or {}).get("filings")
         if isinstance(filings, dict):
-            return filings
-    return {}
+            for name, filing in filings.items():
+                identity = ((filing or {}).get("accession") if isinstance(filing, dict) else None)
+                held.setdefault(identity or f"{_snap.name}:{name}", filing)
+    return held
+
+
+def held_evidence(issuer: str, ticker: str, sources, transcripts,
+                  eight_ks: int | None) -> tuple[dict, dict, list[str]]:
+    """Read the requested view of all evidence held for this exact ticker.
+
+    Ordinary table names use the newest snapshot carrying the table. Transcript and
+    release tables union rows across snapshots, with the newest row winning collisions.
+    """
+    snapshots = _matching_snapshots(issuer, ticker)
+    requested = set(sources)
+    tables: dict[str, pd.DataFrame] = {}
+    provenance: dict[str, dict] = {}
+    absent: list[str] = []
+    transcript_rows: list[dict] = []
+    transcript_quarters: set[str] = set()
+    release_rows: dict[str, dict] = {}
+    families = {"sec": False, "yahoo": False, "alpha_vantage": False}
+    for snap, held_manifest in snapshots:
+        hashes = held_manifest.get("table_hashes") or {}
+        for name, digest in hashes.items():
+            family = ("sec" if name.startswith(STATEMENT_PREFIXES) or name == "sec_8k"
+                      else "yahoo" if name.startswith("yahoo_")
+                      else "alpha_vantage" if name.startswith("av_") else None)
+            if family not in requested:
+                continue
+            families[family] = True
+            if name in ("av_transcript", "sec_8k"):
+                frame = contracts.read_verified_table(snap, name)
+                key = "quarter" if name == "av_transcript" else "accession"
+                if name == "av_transcript":
+                    grouped: dict[str, list[dict]] = {}
+                    for record in frame.to_dict("records"):
+                        row_key = record.get(key)
+                        if row_key is not None:
+                            grouped.setdefault(str(row_key), []).append(record)
+                    for quarter, quarter_rows in grouped.items():
+                        if quarter not in transcript_quarters:
+                            transcript_rows.extend(quarter_rows)
+                            transcript_quarters.add(quarter)
+                else:
+                    for record in frame.to_dict("records"):
+                        row_key = record.get(key)
+                        if row_key is not None:
+                            release_rows.setdefault(str(row_key), record)
+                provenance.setdefault(name, {"snapshot": snap.name, "sha256": digest})
+            elif name not in tables:
+                tables[name] = contracts.read_verified_table(snap, name)
+                provenance[name] = {"snapshot": snap.name, "sha256": digest}
+    if "av_transcript" in provenance:
+        allowed = None if transcripts is None else set(transcripts)
+        rows = [row for row in transcript_rows
+                if allowed is None or str(row.get("quarter")) in allowed]
+        if rows:
+            tables["av_transcript"] = pd.DataFrame(rows)
+        else:
+            provenance.pop("av_transcript")
+    if "sec_8k" in provenance:
+        rows = list(release_rows.values())
+        rows.sort(key=lambda row: (str(row.get("filing_date") or ""),
+                                   str(row.get("accession") or "")), reverse=True)
+        if eight_ks is not None:
+            rows = rows[:eight_ks]
+        if rows:
+            tables["sec_8k"] = pd.DataFrame(rows)
+        else:
+            provenance.pop("sec_8k")
+    for source in sources:
+        if not families[source]:
+            label = {"sec": "SEC", "yahoo": "Yahoo", "alpha_vantage": "Alpha Vantage"}[source]
+            absent.append(f"no {label} evidence held")
+    if "alpha_vantage" in requested and "av_transcript" not in tables \
+            and transcripts != []:
+        absent.append("no transcripts held")
+    if "sec" in requested and "sec_8k" not in tables and eight_ks != 0:
+        absent.append("no releases held")
+    return tables, provenance, absent
 
 
 def _period_labels(df: pd.DataFrame | None, dataset: str = "") -> list[str]:
@@ -333,31 +417,15 @@ def scope_key(issuer: str, ticker: str, sources, transcripts, eight_ks=None) -> 
                                      separators=(",", ":")).encode()).hexdigest()
 
 
-def _cache_lookup(issuer: str, scope_key: str) -> tuple[Path, dict] | None:
-    """The evidence already held for this acquisition scope, if any.
-
-    A plain pull is cache-first: a snapshot acquired for the same issuer, source
-    set and transcript quarters is returned with zero network calls. New
-    acquisition — including fetching fresher data — is an explicit `refresh`.
-    """
-    for snap in reversed(store.snapshot_dirs(issuer)):
-        manifest = json.loads((snap / "snapshot.json").read_text())
-        if manifest.get("scope_key") == scope_key:
-            return snap, manifest
-    return None
-
-
 def pull(ticker: str, *, issuer: str | None = None, sources=None, transcripts=None,
          eight_ks: int | None = None, cache_only: bool = False, refresh: bool = False,
          ceilings: dict[str, int] | None = None) -> dict:
     """Acquire a snapshot for one ticker from the sources named.
 
-    cache_only: never touches the network — the newest snapshot already published
-    for this exact scope, or a MISSING status naming it.
-    plain run: cache-first — a snapshot held for the same scope is returned with
-    zero network calls. The scope is (issuer, ticker, sources, transcripts, eight_ks)
-    and carries no date, so the cache does not expire on its own: a repeat pull stays
-    CACHED until the caller passes `refresh=True`.
+    cache_only: never touches the network — serves the held ticker union, or returns
+    MISSING: NOT_RETRIEVED when no matching snapshot exists.
+    plain run: any published snapshot for this ticker serves the verified union with
+    zero network calls. Request filters shape that bundle; only `refresh=True` acquires.
     nothing retrieved: no snapshot is published at all — a run that acquired no
     evidence records its coverage rows and returns `FAILED`, so the scope is not
     poisoned for later plain pulls.
@@ -389,6 +457,29 @@ def pull(ticker: str, *, issuer: str | None = None, sources=None, transcripts=No
         raise ValueError("eight_ks is a count of filings and cannot be negative")
     derived_transcripts = transcripts is None and "alpha_vantage" in sources
     sec_prefetched = None
+    if transcripts is not None and transcripts and "alpha_vantage" not in sources:
+        raise ValueError("transcripts come from alpha_vantage; name it in sources")
+    if eight_ks and "sec" not in sources:
+        raise ValueError("8-Ks come from sec; name it in sources")
+    matching = _matching_snapshots(issuer, ticker)
+    if matching and not refresh:
+        tables, provenance, absent = held_evidence(issuer, ticker, sources, transcripts,
+                                                   eight_ks)
+        snap, held_manifest = matching[0]
+        scoped_transcripts = transcripts
+        if derived_transcripts:
+            scoped_transcripts = reported_quarters(_held_sec_filings(issuer, ticker))
+        key = scope_key(issuer, ticker, sources, scoped_transcripts, eight_ks)
+        logger.info("CACHED %s: snapshot %s", issuer, snap.name)
+        return {"issuer": issuer, "status": "CACHED", "scope_key": key, "tables": tables,
+                "provenance": provenance, "absent": absent,
+                "snapshot_dirs": [str(path) for path, _ in matching],
+                "snapshot_dir": str(snap), "snapshot": held_manifest,
+                "report": None, "note": "evidence already held; zero network calls",
+                "cache_only": cache_only}
+    if cache_only:
+        logger.info("no snapshot held for ticker %s", ticker)
+        return {"status": "MISSING: NOT_RETRIEVED", "issuer": issuer}
     if derived_transcripts:
         held_filings = _held_sec_filings(issuer, ticker)
         transcripts = reported_quarters(held_filings)
@@ -416,34 +507,6 @@ def pull(ticker: str, *, issuer: str | None = None, sources=None, transcripts=No
     if eight_ks and "sec" not in sources:
         raise ValueError("8-Ks come from sec; name it in sources")
     key = scope_key(issuer, ticker, sources, transcripts, eight_ks)
-
-    if cache_only:
-        hit = _cache_lookup(issuer, key)
-        if hit is None:
-            logger.info("no snapshot held for scope %s", key)
-            return {"status": "MISSING: NOT_RETRIEVED", "issuer": issuer}
-        snap, manifest = hit
-        logger.info("CACHED %s: snapshot %s", issuer, snap.name)
-        return {"issuer": issuer, "cache_only": True, "status": "CACHED",
-                "snapshot_dir": str(snap), "snapshot": manifest}
-
-    if not refresh:
-        hit = _cache_lookup(issuer, key)
-        if hit:
-            snap, manifest = hit
-            logger.info("CACHED %s: snapshot %s", issuer, snap.name)
-            return {
-                "issuer": issuer,
-                "status": "CACHED",
-                "snapshot_dir": str(snap),
-                "retrieved_at": manifest.get("retrieved_at"),
-                "coverage_path": manifest.get("coverage_path"),
-                "tables": len(manifest.get("table_hashes") or {}),
-                "originals": len(manifest.get("originals") or {}),
-                "note": ("evidence already held for this scope — zero network calls; "
-                         "pass --refresh for a new version"),
-            }
-        logger.info("no snapshot held for scope %s", key)
 
     if sec_prefetched is None:
         ceiling = Ceiling(ceilings or {})
@@ -637,6 +700,14 @@ def pull(ticker: str, *, issuer: str | None = None, sources=None, transcripts=No
 
     result = _publish_snapshot(ticker, issuer, sources, transcripts, eight_ks, key, run_id,
                                retrieved_at, rows, tables, provider_meta, originals)
+    result.setdefault("tables", tables)
+    result.setdefault("provenance", {name: {"snapshot": run_id, "sha256": digest}
+                                     for name, digest in result.get("table_hashes", {}).items()})
+    result.setdefault("absent", [])
+    result.setdefault("snapshot_dirs", [result["snapshot_dir"]]
+                       if result.get("snapshot_dir") else [])
+    result.setdefault("report", None)
+    result.setdefault("note", None)
     if derived_transcripts:
         result["reported_quarters"] = transcripts
         if len(transcripts) < 12:
@@ -673,7 +744,8 @@ def _publish_snapshot(ticker: str, issuer: str, sources: list[str], transcripts,
         return {"ticker": ticker, "issuer": issuer, "status": "FAILED",
                 "coverage_path": str(cov_target), "scope_key": key,
                 "sources": sorted(sources), "transcripts": sorted(transcripts or []),
-                "eight_ks": eight_ks,
+                "eight_ks": eight_ks, "tables": {}, "provenance": {}, "absent": [],
+                "snapshot_dirs": [], "report": None, "note": None,
                 "table_hashes": {}, "statuses": statuses, "open_gaps": gaps}
 
     # --- stage the snapshot, then publish it atomically ---
@@ -723,7 +795,11 @@ def _publish_snapshot(ticker: str, issuer: str, sources: list[str], transcripts,
             "scope_key": key,
             "sources": sorted(sources), "transcripts": sorted(transcripts or []),
             "eight_ks": eight_ks,
-            "table_hashes": table_hashes, "statuses": statuses, "open_gaps": gaps}
+            "table_hashes": table_hashes, "statuses": statuses, "open_gaps": gaps,
+            "tables": tables,
+            "provenance": {name: {"snapshot": run_id, "sha256": digest}
+                           for name, digest in table_hashes.items()},
+            "absent": [], "snapshot_dirs": [str(snap_dir)], "report": None, "note": None}
 
 
 def manifest(ticker: str, *, issuer: str | None = None, run_id: str | None = None) -> dict:

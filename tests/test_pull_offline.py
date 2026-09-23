@@ -596,34 +596,30 @@ def test_a_first_pull_derives_twelve_transcript_quarters_from_its_sec_fetch():
         print("  a first pull derives 12 quarters from its own SEC fetch ✓")
 
 
-def test_held_sec_meta_drives_the_default_transcript_scope():
+def test_held_ticker_without_transcripts_serves_and_names_the_absence():
     with _TempPlane():
         sec_double, transcripts = _Sec(shape=AVGO_SHAPE), _Transcripts()
         with _patched(sec_double, _Yahoo(), _Estimates(), transcripts=transcripts):
             held = pull("AVGO", sources=["sec"], eight_ks=0)
             sec_calls = sec_double.calls
             acquired = pull("AVGO", sources=["alpha_vantage"])
-        expected = ["2023Q4", "2024Q1", "2024Q2", "2024Q3", "2024Q4", "2025Q1",
-                    "2025Q2", "2025Q3", "2025Q4", "2026Q1", "2026Q2", "2026Q3"]
-        assert held["status"] == acquired["status"] == "RETRIEVED", (held, acquired)
-        assert transcripts.quarters == expected, transcripts.quarters
-        assert acquired["scope_key"] == scope_key(
-            "AVGO", "AVGO", ["alpha_vantage"], expected)
+        assert held["status"] == "RETRIEVED" and acquired["status"] == "CACHED"
+        assert transcripts.quarters == [], "serving held SEC evidence must not acquire transcripts"
+        assert acquired["tables"] == {}
+        assert "no Alpha Vantage evidence held" in acquired["absent"]
         assert sec_double.calls == sec_calls, "held filing metadata should be read offline"
 
 
-def test_held_vrt_meta_selects_the_expected_newest_four():
+def test_held_vrt_filing_history_is_served_without_transcript_acquisition():
     with _TempPlane():
         transcripts = _Transcripts()
         with _patched(_Sec(shape=VRT_SHAPE), _Yahoo(), _Estimates(),
                       transcripts=transcripts):
             held = pull("VRT", sources=["sec"], eight_ks=0)
             result = pull("VRT", sources=["alpha_vantage"])
-        expected = ["2023Q3", "2023Q4", "2024Q1", "2024Q2", "2024Q3", "2024Q4",
-                    "2025Q1", "2025Q2", "2025Q3", "2025Q4", "2026Q1", "2026Q2"]
-        assert held["status"] == result["status"] == "RETRIEVED", (held, result)
-        assert transcripts.quarters == expected, transcripts.quarters
-        assert transcripts.quarters[-4:] == ["2025Q3", "2025Q4", "2026Q1", "2026Q2"]
+        assert held["status"] == "RETRIEVED" and result["status"] == "CACHED"
+        assert transcripts.quarters == [], "a held ticker serves instead of acquiring transcripts"
+        assert result["tables"] == {} and "no transcripts held" in result["absent"]
 
 
 def test_short_sec_history_is_not_padded_and_is_reported():
@@ -637,6 +633,56 @@ def test_short_sec_history_is_not_padded_and_is_reported():
         assert transcripts.quarters == ["2024Q4", "2025Q4"], transcripts.quarters
         assert result["reported_quarters_note"] == (
             "2 reported quarter(s) available; scope was not padded"), result
+
+
+def test_held_evidence_serves_transcript_union_without_provider_calls():
+    quarters = ["2024Q2", "2024Q3", "2024Q4"] + [
+        f"2025Q{i}" for i in range(1, 5)] + ["2026Q1", "2026Q2", "2026Q3"]
+    newest = ["2025Q4", "2026Q1", "2026Q2", "2026Q3"]
+    with _TempPlane():
+        providers = (_Sec(), _Yahoo(), _Estimates(), _EightK(), _Transcripts())
+        with _patched(*providers[:3], providers[3], transcripts=providers[4]):
+            wide = pull("AVGO", sources=["alpha_vantage"], transcripts=quarters)
+            pull("AVGO", sources=["alpha_vantage"], transcripts=newest)
+            calls = tuple(provider.calls for provider in (providers[0], providers[1], providers[2],
+                                                           providers[3], providers[4]))
+            served = pull("AVGO", sources=["alpha_vantage"])
+        assert served["status"] == "CACHED", served
+        assert served["tables"]["av_transcript"]["quarter"].nunique() == 10
+        assert set(served["tables"]["av_transcript"]["quarter"]) == set(quarters)
+        assert tuple(provider.calls for provider in (providers[0], providers[1], providers[2],
+                                                     providers[3], providers[4])) == calls
+        assert served["provenance"]["av_transcript"]["snapshot"] == \
+            Path(wide["snapshot_dir"]).name
+        latest_manifest = manifest("AVGO", run_id=
+                                   served["provenance"]["av_transcript"]["snapshot"])
+        assert served["provenance"]["av_transcript"]["sha256"] == \
+            latest_manifest["table_hashes"]["av_transcript"]
+        assert served["absent"] == []
+        assert {"status", "issuer", "tables", "provenance", "absent", "snapshot_dirs",
+                "report", "note"} <= served.keys()
+    print("  held transcript union serves offline with provenance ✓")
+
+
+def test_held_evidence_filters_sources_transcripts_and_releases():
+    with _TempPlane():
+        with _patched(_Sec(), _Yahoo(), _Estimates(), _EightK(), transcripts=_Transcripts()):
+            pull("NVDA", sources=["sec"], eight_ks=2)
+            pull("NVDA", sources=["alpha_vantage"], transcripts=["2026Q1", "2026Q2"],
+                 refresh=True)
+            result = pull("NVDA", sources=["yahoo"])
+            assert result["status"] == "CACHED", result
+            assert all(name.startswith("yahoo_") for name in result["tables"])
+            quarter = pull("NVDA", sources=["alpha_vantage"], transcripts=["2026Q2"],
+                           eight_ks=0)
+            assert set(quarter["tables"]["av_transcript"]["quarter"]) == {"2026Q2"}
+            filtered = pull("NVDA", sources=["sec", "alpha_vantage"], transcripts=[],
+                            eight_ks=1)
+        assert filtered["status"] == "CACHED", filtered
+        assert "sec_8k" in filtered["tables"]
+        assert len(filtered["tables"]["sec_8k"]) == 1
+        assert "av_transcript" not in filtered["tables"]
+    print("  held evidence filters families and release depth ✓")
 
 
 def test_a_restricted_default_pull_stays_transcript_free_and_does_not_raise():
@@ -674,24 +720,26 @@ def test_a_repeat_pull_is_cached_with_zero_provider_calls():
         print("  a repeat pull is CACHED with zero provider calls ✓")
 
 
-def test_each_source_set_publishes_its_own_snapshot():
+def test_held_ticker_filters_to_requested_source_family():
     with _TempPlane():
         s, y, a = _Sec(), _Yahoo(), _Estimates()
         with _patched(s, y, a):
             yahoo_only = pull("NVDA", sources=["yahoo"])
             sec_only = pull("NVDA", sources=["sec"], eight_ks=0)
             again = pull("NVDA", sources=["yahoo"])
-        assert len(store.snapshot_dirs("NVDA")) == 2, "one scope, one snapshot"
+            default = pull("NVDA")
+        assert len(store.snapshot_dirs("NVDA")) == 1, "a held ticker serves its union"
         assert set(yahoo_only["table_hashes"]) == set(yahoo.DATASETS), yahoo_only["table_hashes"]
         assert all(k.startswith(("income_", "balance_", "cashflow_"))
-                   for k in sec_only["table_hashes"]), sec_only["table_hashes"]
+                   for k in sec_only["tables"]), sec_only["tables"]
         assert set(yahoo_only["statuses"]) == set(yahoo.DATASETS), yahoo_only["statuses"]
-        assert not any(k.startswith("yahoo_") for k in sec_only["statuses"]), sec_only["statuses"]
-        # neither source set is a cache hit for the other, and yahoo was asked once
-        assert sec_only["status"] == "RETRIEVED" and again["status"] == "CACHED"
-        assert y.calls == 1 and s.calls > 0
+        # the source filter returns no network-backed missing family on this held ticker
+        assert "no SEC evidence held" in sec_only["absent"]
+        assert sec_only["status"] == "CACHED" and again["status"] == "CACHED"
+        assert default["status"] == "CACHED" and "no SEC evidence held" in default["absent"]
+        assert y.calls == 1 and s.calls == 0
         assert yahoo_only["scope_key"] != sec_only["scope_key"]
-        print("  each source set publishes its own snapshot; neither satisfies the other ✓")
+        print("  held source-set filters serve only requested evidence ✓")
 
 
 def test_a_failing_provider_becomes_coverage_rows_not_an_exception():
@@ -914,6 +962,28 @@ def test_one_issuer_two_tickers_do_not_share_a_snapshot():
         print("  one issuer's two tickers hold their own snapshots ✓")
 
 
+def test_serving_one_listing_does_not_mix_the_other_listings_tables():
+    with _TempPlane():
+        y = _Yahoo()
+        original_fetch = y.__call__
+
+        def ticker_frames(ticker, issuer=None, ceiling=None):
+            frames, meta = original_fetch(ticker, issuer, ceiling)
+            frames["yahoo_prices"].loc[0, "Close"] = 11 if ticker == "NSRGY" else 22
+            return frames, meta
+
+        with _patched(_Sec(), ticker_frames, _Estimates()):
+            adr = pull("NSRGY", issuer="NESTLE", sources=["yahoo"])
+            pull("NESN.SW", issuer="NESTLE", sources=["yahoo"])
+            calls = y.calls
+            served = pull("NSRGY", issuer="NESTLE", sources=["yahoo"])
+        assert served["status"] == "CACHED" and y.calls == calls == 2
+        assert served["tables"]["yahoo_prices"].loc[0, "Close"] == 11
+        assert served["provenance"]["yahoo_prices"]["snapshot"] == \
+            Path(adr["snapshot_dir"]).name
+        print("  serving one listing excludes the other listing's tables ✓")
+
+
 def test_refresh_adds_a_version_and_leaves_the_first_untouched():
     with _TempPlane():
         s, y, a = _Sec(), _Yahoo(), _Estimates()
@@ -1022,7 +1092,7 @@ def test_a_cached_quarter_is_reused_and_the_rest_is_acquired():
                 with _patched(_Sec(), _Yahoo(), _Estimates(),
                               transcripts=_real_transcript):
                     second = pull("NVDA", sources=["alpha_vantage"],
-                                       transcripts=["2025Q1", "2025Q2"])
+                                       transcripts=["2025Q1", "2025Q2"], refresh=True)
         assert second["status"] == "RETRIEVED", second
         assert provider.call_count == 1, "a held quarter must not be re-pulled"
         rows = {r["dataset"]: r for r in _coverage(second)["rows"]}
@@ -1148,7 +1218,7 @@ def test_export_reads_only_the_latest_snapshot():
         with mock.patch.object(store, "now_iso", _ageing_clock()), _patched(s, y, a):
             everything = pull("NVDA")
             export_csv("NVDA")                                # a complete set first
-            later = pull("NVDA", sources=["alpha_vantage"])  # a thinner latest version
+            later = pull("NVDA", sources=["alpha_vantage"], refresh=True)  # a thinner latest version
         exported = export_csv("NVDA")
         latest = Path(later["snapshot_dir"]).name
         assert set(exported.values()) == {latest}, exported
@@ -1191,7 +1261,7 @@ def test_publishing_a_thinner_snapshot_warns():
                 _patched(_Sec(), _Yahoo(), _Estimates()):
             pull("NVDA")
             with mock.patch.object(pull_logger, "warning") as warn:
-                pull("NVDA", sources=["alpha_vantage"])
+                pull("NVDA", sources=["alpha_vantage"], refresh=True)
         said = " ".join(str(call.args[0] % call.args[1:]) for call in warn.call_args_list)
         assert "thinner" in said, said
         assert "income_annual_0" in said or "yahoo_prices" in said, said
@@ -1256,17 +1326,38 @@ def test_eight_k_filings_are_archived_per_filing_and_scoped_by_depth():
         held = manifest("NVDA", run_id=Path(deep["snapshot_dir"]).name)
         assert held["eight_ks"] == 3, held
         assert Path(held["originals"]["sec_8k_0000000000-25-000010"]).is_file()
-        # depth is part of the scope: a different count is its own acquisition
+        # Depth and source filters now shape a serve; neither causes a new acquisition.
         assert len({deep["scope_key"], shallow["scope_key"], without["scope_key"]}) == 3
-        assert shallow["status"] == "RETRIEVED" and again["status"] == "CACHED", (shallow, again)
+        assert shallow["status"] == again["status"] == without["status"] == "CACHED"
+        assert len(shallow["tables"]["sec_8k"]) == 1
+        assert "sec_8k" not in without["tables"]
         assert early["sec_8k"] == Path(deep["snapshot_dir"]).name, early
         assert (store.CSV / "NVDA" / "sec_8k.csv").is_file()
-        # the newest run asked for no 8-Ks, so the export is the newest run: the CSV from the
-        # earlier one goes rather than being left beside current files as if it were current
+        assert "sec_8k" in export_csv("NVDA"), "exports remain newest-snapshot-only"
+    print("  8-K depth filters the held union without acquiring ✓")
+
+
+def test_export_prunes_csv_missing_from_newest_snapshot():
+    with _TempPlane():
+        with _patched(_Sec(), _Yahoo(), _Estimates()):
+            pull("NVDA", sources=["yahoo"])
         exported = export_csv("NVDA")
-        assert "sec_8k" not in exported, exported
-        assert not (store.CSV / "NVDA" / "sec_8k.csv").exists(), "a stale export is pruned"
-    print("  8-K filings are archived per filing, and a shallower depth is its own scope ✓")
+        assert "yahoo_prices" in exported
+        run_id = "9999-01-01T000000+0000-newest"
+        staging = store.staging_dir("NVDA", run_id)
+        frame = pd.DataFrame({"Value": [7]})
+        frame.to_parquet(staging / "only_table.parquet")
+        digest = store.sha256_file(staging / "only_table.parquet")
+        store.write_snapshot_manifest(staging, {
+            "issuer": "NVDA", "ticker": "NVDA", "run_id": run_id,
+            "table_hashes": {"only_table": digest}, "originals": {},
+        })
+        store.commit_snapshot(staging, run_id)
+        newest_export = export_csv("NVDA")
+        assert newest_export == {"only_table": run_id}, newest_export
+        assert not (store.CSV / "NVDA" / "yahoo_prices.csv").exists()
+        assert (store.CSV / "NVDA" / "only_table.csv").is_file()
+    print("  export prunes a stale CSV when newest snapshot omits that table ✓")
 
 
 def test_a_sec_run_with_no_earnings_8k_reports_the_gap():
@@ -1482,6 +1573,8 @@ def test_a_cache_only_hit_logs_cached_and_nothing_else():
 
 
 if __name__ == "__main__":
+    test_held_evidence_serves_transcript_union_without_provider_calls()
+    test_held_evidence_filters_sources_transcripts_and_releases()
     test_the_sec_fixture_serves_a_twelve_quarter_avgo_history()
     test_the_sec_fixture_serves_a_calendar_year_vrt_history()
     test_the_sec_fixture_still_raises_for_a_filing_it_does_not_hold()
@@ -1489,12 +1582,12 @@ if __name__ == "__main__":
     test_reported_quarters_uses_filing_periods_and_skips_missing_entries()
     test_default_transcripts_without_sec_evidence_require_explicit_labels()
     test_a_first_pull_derives_twelve_transcript_quarters_from_its_sec_fetch()
-    test_held_sec_meta_drives_the_default_transcript_scope()
-    test_held_vrt_meta_selects_the_expected_newest_four()
+    test_held_ticker_without_transcripts_serves_and_names_the_absence()
+    test_held_vrt_filing_history_is_served_without_transcript_acquisition()
     test_short_sec_history_is_not_padded_and_is_reported()
     test_a_restricted_default_pull_stays_transcript_free_and_does_not_raise()
     test_a_repeat_pull_is_cached_with_zero_provider_calls()
-    test_each_source_set_publishes_its_own_snapshot()
+    test_held_ticker_filters_to_requested_source_family()
     test_a_failing_provider_becomes_coverage_rows_not_an_exception()
     test_a_statement_that_fails_to_convert_is_parse_failed_not_absent()
     test_a_yahoo_dataset_failure_keeps_the_error_text()
@@ -1503,6 +1596,7 @@ if __name__ == "__main__":
     test_a_bogus_ticker_records_gaps_and_publishes_no_snapshot()
     test_a_failed_run_is_not_cached_and_the_scope_recovers()
     test_one_issuer_two_tickers_do_not_share_a_snapshot()
+    test_serving_one_listing_does_not_mix_the_other_listings_tables()
     test_an_empty_source_set_is_refused_not_read_as_every_source()
     test_refresh_adds_a_version_and_leaves_the_first_untouched()
     test_a_transcript_quarter_reports_the_providers_own_reason()
@@ -1516,6 +1610,7 @@ if __name__ == "__main__":
     test_publishing_a_thinner_snapshot_warns()
     test_the_cli_export_prints_provenance_and_makes_no_network_call()
     test_eight_k_filings_are_archived_per_filing_and_scoped_by_depth()
+    test_export_prunes_csv_missing_from_newest_snapshot()
     test_a_sec_run_with_no_earnings_8k_reports_the_gap()
     test_eight_ks_without_the_sec_source_are_refused()
     test_the_scope_key_is_stable_for_every_scope_that_predates_8k()

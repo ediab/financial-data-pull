@@ -243,7 +243,10 @@ def _stored() -> None:
     with mock.patch.object(store, "now_iso", _ageing_clock()), \
             _patched(_Filings(), _Transcripts()):
         pull("NVDA", sources=["sec"], eight_ks=2)
-        pull("NVDA", sources=["alpha_vantage"], transcripts=["2026Q1", "2026Q2"])
+        # A held ticker now serves by default; explicitly refresh to fabricate the
+        # second independent snapshot this newest-snapshot view test requires.
+        pull("NVDA", sources=["alpha_vantage"], transcripts=["2026Q1", "2026Q2"],
+             refresh=True)
 
 
 def _dump(issuer: str = "NVDA") -> list[dict]:
@@ -449,7 +452,8 @@ def test_the_cli_exports_views_offline_and_refuses_acquisition_flags():
         with mock.patch.object(store, "now_iso", _ageing_clock()), _patched(filings,
                                                                            transcripts):
             pull("NVDA", sources=["sec"], eight_ks=2)
-            pull("NVDA", sources=["alpha_vantage"], transcripts=["2026Q1", "2026Q2"])
+            pull("NVDA", sources=["alpha_vantage"], transcripts=["2026Q1", "2026Q2"],
+                 refresh=True)
         # every provider now fails if touched: the export must ask none of them
         out = io.StringIO()
         with _patched(_Filings(fail=True), mock.Mock(side_effect=RuntimeError("offline"))), \
