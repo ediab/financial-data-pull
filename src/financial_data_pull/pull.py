@@ -39,7 +39,7 @@ RESERVED_COLUMNS = {"concept", "label", "dimension"}
 RUN_STATUSES = ("MISSING", "FAILED", "RATE_LIMITED", "PARSE_FAILED")
 # how much filing history one acquisition covers (master plan §4 data baseline)
 ANNUAL_FILINGS = 3
-QUARTERLY_FILINGS = 8
+QUARTERLY_FILINGS = 9
 STATEMENT_PREFIXES = ("income_", "balance_", "cashflow_")
 # the source sets a snapshot can be scoped to; a snapshot satisfies only the
 # scope it was acquired for, so each may be refreshed on its own schedule
