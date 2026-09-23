@@ -1281,8 +1281,15 @@ def test_the_cli_prints_the_run_status_to_stderr():
         spent = sum(result["requests"].values())
         assert f"NEW SNAPSHOT {run_id} — {spent} requests spent" in err.getvalue().splitlines(), \
             err.getvalue()
-        # the status line is a stderr aside: stdout still parses as the same JSON
+        # stdout is a summary, not a serialization of the DataFrames.
         assert result["status"] == "RETRIEVED"
+        assert {"report", "provenance", "absent", "table_names"} <= result.keys()
+        assert "tables" not in result
+        assert result["table_names"]
+        assert all(set(shape) == {"rows", "columns"}
+                   for shape in result["table_names"].values())
+        assert "Total revenue" not in out.getvalue()
+        assert "DataFrame" not in out.getvalue()
 
         out, err = io.StringIO(), io.StringIO()
         with _patched(_Sec(fail=True), _Yahoo(fail=True), _Estimates(fail=True),

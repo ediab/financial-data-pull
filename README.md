@@ -1,11 +1,11 @@
 # financial-data-pull
 
-Pulls a ticker's financial data from SEC EDGAR, Alpha Vantage and Yahoo, and
-stores it locally so the next call for the same thing reads the cache instead of
-the network.
+Pulls a ticker's financial data from SEC EDGAR, Alpha Vantage and Yahoo into local
+immutable snapshots. A ticker with held evidence is served from the verified union;
+network acquisition is explicit through `refresh=True` or the first pull.
 
-It acquires and caches data. It does not interpret it: no model, no checks, no
-valuation.
+The library verifies its evidence — statement arithmetic and earnings-release ties —
+and does not interpret, normalize or forecast the data.
 
 The scope is deliberately narrow: no approval gates, no cases, no proposals, no
 memo, no workbooks, no FRED and no macro series. The pull and its cache are the
@@ -46,42 +46,63 @@ The JSON result is printed to stdout. One line per dataset (INFO) and one human
 status line for the run go to **stderr**, so redirecting stdout still captures just
 the JSON. `--quiet` drops those stderr lines to warnings only.
 
-Or from Python:
+## How to pull
 
 ```python
 from financial_data_pull import export_csv, manifest, pull, read_table
 from financial_data_pull.views import export_views
 
-result = pull("NVDA")                  # first call: network + a new snapshot
-                                       # (statements, prices and the last 4 transcripts)
-pull("NVDA")                           # {"status": "CACHED", ...} — zero network
-pull("NVDA", refresh=True)             # add a new snapshot version
-pull("NVDA", cache_only=True)          # never touches the network
-pull("NVDA", sources=["yahoo"])        # its own snapshot, its own refresh cadence
-pull("NVDA", transcripts=[])           # opt out of the default transcripts
-pull("NVDA", sources=["alpha_vantage"], transcripts=["2026Q1", "2026Q2"])
-pull("NVDA", eight_ks=10)              # Item 2.02 8-Ks + their Exhibit 99.1
+result = pull("NVDA")                  # serves held union or acquires if nothing is held
+pull("NVDA", refresh=True)             # explicitly acquire a new snapshot
+pull("NVDA", cache_only=True)          # zero network; MISSING if nothing is held
+pull("NVDA", sources=["yahoo"])        # filters a held bundle; refresh acquires this source set
+pull("NVDA", transcripts=[])           # opt out of transcripts on acquisition
+pull("NVDA", eight_ks=0)                # opt out of earnings releases
 
-manifest("NVDA")                       # the newest snapshot's snapshot.json
+manifest("NVDA")                       # newest snapshot manifest
 read_table("NVDA", "income_annual_0")  # hash-verified read
-export_csv("NVDA")                     # {table: snapshot_id}, writes data/csv/NVDA/
-export_views("NVDA")                   # {group: count}, writes data/derived/NVDA/
+export_csv("NVDA")                     # newest-snapshot CSV set
+export_views("NVDA")                   # releases/transcripts and 8k_cells.csv
 ```
 
-To read a table without knowing a `run_id`, read the newest snapshot: `read_table`
-does that, hash-verified. `export_csv` writes the same view as CSVs — one snapshot,
-never a mixture — so a table the newest snapshot does not carry is a loud gap rather
-than a quiet answer from an older version. A pull that leaves the newest snapshot
-thinner than the previous one warns when it publishes.
+Every successful `pull` bundle has `tables`, `report`, `provenance`, `absent`,
+`status`, and run/snapshot facts. `tables` contains per-filing datasets plus computed
+`income_history`, `balance_history`, and `cashflow_history` when those families are
+held. `report` contains the verdict (`CHECKED`, `DISCREPANCY`, or `UNCHECKED`), six
+named checks (`balance`, `ytd_sum`, `q4_fy`, `revenue_release`, `cash_reconcile`,
+`quarter_window`), tolerances, identified concepts and gaps; checks never block
+otherwise publishable evidence. `provenance` maps tables to their source snapshot
+and hash (history tables name source snapshots), and `absent` names requested
+families with no held evidence. Acquisition results also include `snapshot_dir`, `coverage_path`,
+`scope_key`, `sources`, `transcripts`, `eight_ks`, `table_hashes`, `statuses`,
+`open_gaps`, `requests`, and sometimes `reported_quarters` and its note. Served
+results include `snapshot`, `snapshot_dirs`, and `cache_only`. CLI JSON includes the
+run facts, `report`, `provenance`, `absent`, and `table_names` (`{name: {rows,
+columns}}`) rather than DataFrame contents.
+
+A plain call for any held ticker serves the verified union of its snapshots with zero
+network; filters shape that bundle. Only `refresh=True` acquires and folds held
+evidence forward. The canonical scope is 12 reported quarters, with 12 earnings
+releases by default when SEC is requested (`eight_ks=0` opts out). To acquire a
+changed release depth, use `refresh=True`; it acquires the full requested source set.
+Transcript labels
+derive from SEC filing periods; when no SEC evidence exists, pass explicit labels. A
+held ticker's first refresh may re-acquire the full source set once because the
+canonical scope widened. An acquisition can make up to 12 Alpha Vantage transcript
+calls at 1.5-second spacing; a quarter already held is never re-asked.
+
+Report tolerances: statement arithmetic within $1,000 of filing rounding; release
+ties within 0.5 × the release's stated scale (1e6, then 1e3); cash reconciliation
+below `0.05 × 5e9`; and 12 contiguous quarter ends with 80–105-day gaps (11 noted).
 
 ## What it pulls
 
 | Source | Tables | Notes |
 |---|---|---|
-| SEC EDGAR (edgartools) | 33 | 3 annual 10-K + 8 quarterly 10-Q → `income_`, `balance_`, `cashflow_` each, `_annual_0..2` / `_quarterly_0..7` (index 0 is the most recent filing) |
+| SEC EDGAR (edgartools) | up to 36 | 3 annual 10-K + 9 quarterly 10-Q → `income_`, `balance_`, `cashflow_` each, `_annual_0..2` / `_quarterly_0..8` (index 0 is the most recent filing) |
 | Yahoo (yfinance) | 8 | `yahoo_prices` (1 year of daily bars) + 7 analyst datasets (`yahoo_earnings_estimate`, `yahoo_revenue_estimate`, `yahoo_eps_trend`, `yahoo_eps_revisions`, `yahoo_analyst_price_targets`, `yahoo_recommendations`, `yahoo_upgrades_downgrades`) |
-| Alpha Vantage | 2 | `av_earnings_estimates` (one request) + `av_transcript`, one call per quarter of the last 4 **completed** calendar quarters derived from today (1.5s spacing, retried on the free tier's limiter). Transcripts are acquired only when `alpha_vantage` is among `sources`; `--transcripts none` (or `transcripts=[]`) opts out, and an explicit `YYYYQN` list names the quarters instead |
-| SEC EDGAR (opt-in) | 1 | `sec_8k` — one row per Item 2.02 earnings 8-K (ticker, filing date, accession, items, exhibit file and path). The Exhibit 99.1 press release is preserved untouched under `raw/`; `--earnings-8k N` sets how many filings, newest first |
+| Alpha Vantage | 2 | `av_earnings_estimates` (one request) + `av_transcript`, up to 12 filing-reported quarters (1.5s spacing, retried on the free tier's limiter). Transcripts require `alpha_vantage`; labels derive from held SEC filing periods, or the current SEC fetch on a first acquisition. Without SEC evidence, supply explicit `YYYYQN` labels. `--transcripts none` (or `transcripts=[]`) opts out |
+| SEC EDGAR | 1 | `sec_8k` — one row per Item 2.02 earnings 8-K (ticker, filing date, accession, items, exhibit file and path). The Exhibit 99.1 press release is preserved untouched under `raw/`; default depth is 12 with SEC, `--earnings-8k N` changes it and `0` opts out |
 
 SEC tables are one row per XBRL concept. Period columns are labelled as the filing
 states them: flows carry `(FY)`, `(Qn)` or `(YTD)`, balance sheets carry bare
@@ -98,7 +119,7 @@ data/raw/<ticker>/<provider>/<sha256>/payload.<ext>   originals, content-address
 data/tables/<ticker>/<run-id>/<table>.parquet         the tables
 data/tables/<ticker>/<run-id>/snapshot.json           manifest: sources, hashes, provenance
 data/coverage/<ticker>/<run-id>.json                  one row per dataset: status + reason
-data/csv/<ticker>/<table>.csv                         readable export, newest good copy per table
+data/csv/<ticker>/<table>.csv                         newest snapshot tables + history CSV extras
 data/derived/<ticker>/documents/8-k/<date>-<accession>-<exhibit>.htm   copies of the exhibits
 data/derived/<ticker>/documents/transcript/<quarter>.md                rendered call transcript
 data/derived/<ticker>/8k_cells.csv                     one row per cell of every release table
@@ -106,11 +127,11 @@ data/derived/<ticker>/8k_cells.csv                     one row per cell of every
 
 A `run-id` looks like `2026-09-21T145130+0000-fa3741`. A refresh adds a new one.
 
-`--export-csv` writes one CSV per table and prints the snapshot each table came
-from (`income_annual_0 ← 2026-09-21T145130+0000-fa3741`). Every table comes from the
-newest snapshot, so the directory holds one version of the evidence and never a
-mixture; a table that snapshot does not carry is absent from the export, and a CSV an
-earlier export left behind is removed. A named index becomes a column of its own — the
+`--export-csv` writes one CSV per manifest table in the newest snapshot plus the
+three `<family>_history.csv` extras when those families exist. It prints the snapshot
+each table came from (`income_annual_0 ← 2026-09-21T145130+0000-fa3741`). The directory
+holds one evidence version, never a mixture; stale files outside that set are pruned.
+A named index becomes a column of its own — the
 dates on `yahoo_prices`, the period on the analyst frames — because an undated price
 row is not evidence. The CSVs are derived: they can always be rewritten from the
 snapshots, and the snapshots stay the evidence. `av_transcript` content is long
@@ -174,38 +195,26 @@ a hand-written index would.
   rows and reports `FAILED` — so a failed acquisition never reads back as `CACHED`.
   The CLI exits non-zero for a run that published nothing, so a scheduled pull cannot
   report success while the store is unchanged.
-- **Cache-first, per source set.** `pull("NVDA")` twice makes one network run.
-  The cache key is the issuer, the ticker, the source set, the transcript quarters
-  and the 8-K depth, and it contains no date — so the cache never expires on its
-  own. Freshness is the explicit `refresh=True`. Because the key is per source set, a
-  daily Yahoo refresh does not re-pull 11 SEC filings. A transcript quarter already held
-  is frozen evidence and is reused rather than re-asked, `refresh=True` included, so the
-  provider is asked once per quarter — and a refresh folds those held quarters into the
-  new snapshot instead of leaving them behind in the old one. A pull without 8-Ks keeps the
-  8-K component of its key exactly as it was before the 8-K parameter existed.
-- **The default scope moves once per calendar quarter.** A plain pull derives its
-  transcript quarters from today, so the key changes at each rollover: the first plain
-  pull after one is a **full re-acquisition of the whole source set** — SEC (~22
-  requests, ~98 MB of originals), Yahoo, estimates and the one new transcript — not
-  just the new quarter. Every quarter already held costs nothing. Pass
-  `transcripts=[]` (`--transcripts none`) for a scope that never moves. A quarter
-  Alpha Vantage has not posted yet — a call that just ended, typically — is recorded
-  `MISSING`, and because the scope then caches, later plain pulls keep missing it
-  until `refresh=True` (`--refresh`) retries it.
+- **Serve-first; refresh is explicit.** Any held snapshot for the requested ticker
+  serves the verified union of its evidence with zero network; source, transcript,
+  and release filters shape the bundle. `refresh=True` acquires and folds held
+  evidence forward. Scope keys remain acquisition facts, not the serve condition.
+  The canonical scope widened to 12 reported quarters and 12 releases, so a held
+  ticker's first refresh may re-acquire its whole source set once (~22 SEC statement
+  requests and ~98 MB originals, plus other requested sources). Held transcript
+  quarters are frozen and never re-asked. Default transcript labels come from SEC
+  filing periods; a source set without SEC evidence requires explicit labels.
+  Missing provider quarters are recorded as gaps; use `refresh=True` to retry.
 - **`cache_only=True` never touches the network**, and returns
-  `{"status": "MISSING: NOT_RETRIEVED"}` when nothing is held for that scope.
+  `{"status": "MISSING: NOT_RETRIEVED"}` when no ticker-matching snapshot is held.
 
 ## Providers and quotas
 
 Alpha Vantage is a source for earnings estimates and transcripts and nothing
-else — it is never a price source and never a fallback for Yahoo. The free tier is
-tightly limited, so a plain `pull(ticker)` spends up to five requests on a first
-acquisition — one for `av_earnings_estimates` and one per transcript quarter, four by
-default. A quarter already held in a snapshot costs zero. A calendar-quarter rollover
-is a new scope, so its first plain pull spends the two AV requests that scope needs —
-one for estimates, one for the newly completed transcript — plus the SEC and Yahoo
-re-acquisition the new scope implies. `--ceiling` caps a run (requests are counted and
-returned either way).
+else — it is never a price source and never a fallback for Yahoo. Its free tier is
+tightly limited. An acquisition may make up to 12 transcript calls, spaced at 1.5
+seconds; a quarter already held is frozen evidence and never re-asked. The estimates
+call is separate. `--ceiling` caps a run (requests are counted and returned either way).
 Transcript calls are counted under their own `alpha_vantage_transcripts` key, so
 `--ceiling alpha_vantage=10,alpha_vantage_transcripts=2` caps the two
 independently.
@@ -220,16 +229,15 @@ and the preserved full-text submissions dominate the disk (~98 MB for one ticker
 archived (the filing's full-text submission, which also carries the exhibit) plus a
 few for the filing index itself, and those requests count under the same
 `--ceiling sec=N` key. A run with 8-Ks is a new
-scope: the first one re-acquires its whole source set — Yahoo, Alpha Vantage and all
-11 SEC filings — and not only the 8-Ks. The same holds for a transcript quarter the
-default scope has newly picked up. When only the documents are wanted, name
+scope: the first one re-acquires its whole source set — Yahoo, Alpha Vantage and the
+statement filings — and not only the 8-Ks. When only SEC evidence is wanted, name
 `--sources sec` (which also keeps the run transcript-free, since transcripts need
 `alpha_vantage`).
 
 ## Tests
 
 ```sh
-bash tests/run_all.sh     # four suites, all offline: providers are doubled
+bash tests/run_all.sh     # five suites, all offline: providers are doubled
 ```
 
 `scripts/check_store_view.py` is the other direction — against a real store:
@@ -250,7 +258,8 @@ either a parse bug or a period you built from the wrong filing.
 
 ## Out of scope
 
-The model, checks, valuation, delivery, memo, workbooks, Excel recalculation,
-company-document fetching beyond the archived 8-K exhibits, per-ticker metric maps built
-inside this library (the 8-K cell dump ships; interpreting it does not), PDF parsing,
-DuckDB, FRED and macro series. They live downstream of the pull.
+Forecasting, modeling, valuation, delivery, memo, workbooks, Excel recalculation,
+company-document fetching beyond the archived 8-K exhibits, per-ticker metric maps
+(the 8-K cell dump ships; interpreting it does not), PDF parsing, DuckDB, FRED and
+macro series. The library verifies as-filed arithmetic and release ties; it does not
+interpret, normalize or forecast.

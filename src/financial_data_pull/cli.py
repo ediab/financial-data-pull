@@ -63,6 +63,20 @@ def _setup_logging(quiet: bool) -> None:
     root.setLevel(logging.WARNING if quiet else logging.INFO)
 
 
+def _stdout_result(result: dict) -> dict:
+    """Return JSON run facts without serializing the DataFrame payloads."""
+    payload = dict(result)
+    tables = payload.pop("tables", {})
+    payload["table_names"] = {
+        name: {"rows": len(frame.index), "columns": len(frame.columns)}
+        for name, frame in tables.items()
+    }
+    payload.setdefault("report", None)
+    payload.setdefault("provenance", {})
+    payload.setdefault("absent", [])
+    return payload
+
+
 def _status_line(result: dict) -> str | None:
     """One human line saying whether the run answered from cache or went to the network.
 
@@ -177,12 +191,12 @@ def main(argv: list[str] | None = None) -> int:
                    help=f"comma-separated source set ({', '.join(SOURCES)}); default: all")
     p.add_argument("--transcripts", default=None,
                    help="earnings-call quarters to acquire, comma-separated YYYYQN labels "
-                        "(for example 2025Q1,2025Q2); default: the last 4 completed "
-                        "calendar quarters, which needs alpha_vantage — pass \"none\" to "
-                        "opt out")
+                        "(for example 2025Q1,2025Q2); default: up to 12 quarters derived "
+                        "from SEC filing periods when alpha_vantage is requested — pass "
+                        "\"none\" to opt out; without SEC evidence, supply labels")
     p.add_argument("--earnings-8k", type=int, default=None, metavar="N",
                    help="archive the N most recent Item 2.02 earnings 8-Ks with their "
-                        "Exhibit 99.1 press release; needs sec")
+                        "Exhibit 99.1 press release; needs sec (default: 12; use 0 to opt out)")
     p.add_argument("--export-csv", action="store_true",
                    help="write one CSV per table into data/csv/<issuer>/ from the snapshots "
                         "already held and print each table's snapshot; no network, and not "
@@ -262,7 +276,7 @@ def main(argv: list[str] | None = None) -> int:
         line = _status_line(result)
         if line:
             print(line, file=sys.stderr)
-    print(json.dumps(result, indent=2, default=str))
+    print(json.dumps(_stdout_result(result), indent=2, default=str))
     return 1 if result.get("status") in UNPUBLISHED_STATUSES else 0
 
 

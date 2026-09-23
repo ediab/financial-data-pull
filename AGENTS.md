@@ -1,15 +1,15 @@
 # financial_data_pull — notes for agents
 
-Acquisition and caching only. This project pulls a ticker's data into an immutable
-local store; interpretation lives downstream, so the model, checks, valuation,
-memo and workbook work belongs in the consuming project.
+This project pulls a ticker's data into an immutable local store and verifies its
+evidence (statement arithmetic and release ties). It does not interpret, normalize or
+forecast; modeling and valuation belong downstream.
 
 ## Read first
 
-- `README.md` — what the library pulls (including the last four call transcripts a
-  plain pull acquires by default), where the data lands, and the guarantees the store
+- `README.md` — what the library pulls (including up to 12 filing-reported call
+  transcripts a plain pull may acquire), where the data lands, and store guarantees
   provides.
-- `tests/run_all.sh` — four offline suites that pin those guarantees; read the
+- `tests/run_all.sh` — five offline suites that pin those guarantees; read the
   suite covering the path you are about to change.
 
 ## Conventions the code does not show
@@ -19,7 +19,7 @@ memo and workbook work belongs in the consuming project.
 - **Tests stay offline.** Double `providers.sec.statements`, `providers.sec.earnings_8k`,
   `providers.yahoo.fetch` and `providers.alphavantage.*`, and wrap the store with
   `tests/test_store._TempPlane`, so a suite run touches neither the network nor the
-  repo's `data/`. `bash tests/run_all.sh` runs all four suites. The opposite check —
+  repo's `data/`. `bash tests/run_all.sh` runs all five suites. The opposite check —
   `scripts/check_store_view.py`, which reads a populated `data/` and nothing else — is
   deliberately outside the suite.
 - **Statement tables are not uniform across issuers.** `dimension` is a *boolean*: the
@@ -40,17 +40,16 @@ memo and workbook work belongs in the consuming project.
   hash-checked reads, and per-dataset status with a reason are what this library is
   for. A change near `save_raw`, `commit_snapshot` or `read_verified_table` earns a
   test that goes red when the guarantee breaks.
-- **Scope is per source set.** `sources=["yahoo"]` and `sources=["sec"]` publish
-  separate snapshots with separate cache keys — the key is issuer + ticker + source
-  set + transcript quarters + 8-K depth — which is what keeps a price refresh from
-  re-pulling 11 filings. Keep the split.
+- **Scope keys describe acquisitions, not serves.** `sources=["yahoo"]` and
+  `sources=["sec"]` publish separate snapshots with separate keys — issuer + ticker
+  + source set + transcript quarters + 8-K depth. Any held snapshot for the requested
+  ticker serves the verified union with zero network; only `refresh=True` acquires.
+  Refreshes fold held evidence forward. A held ticker's first refresh may re-acquire
+  the full source set once because the canonical default scope widened.
 - **Scope-key serialization is load-bearing.** `eight_ks` joins the scope dict only
-  when truthy, so a pull asking for no 8-Ks hashes exactly as it did before the
-  parameter existed and still answers from the snapshots already held. A golden test
-  pins that hash; changing the serialization orphans every held snapshot, which
-  becomes a permanent cache miss and a re-download. (It is the *derived transcript
-  quarters* a plain pull now carries that move the default scope, once a quarter —
-  see the transcripts gotcha.)
+  when truthy, so an explicit no-release request preserves its historical key shape.
+  A golden test pins that hash; changing serialization needlessly churns acquisition
+  identities. The key records what a refresh acquires, not whether evidence can serve.
 - **`data/csv/` is derived, never evidence.** `export_csv` reads the newest snapshot —
   the same view `read_table` reads — through the same hash check, verifying every table
   before it writes the first CSV; a recorded parquet that has vanished refuses the export
@@ -86,22 +85,21 @@ memo and workbook work belongs in the consuming project.
 - `from financial_data_pull import pull` binds the **function** (the package
   re-exports it). Import from `financial_data_pull.pull` to reach `SOURCES`,
   `Ceiling`, `scope_key`, or the module itself.
-- **Transcripts are in the default pull and need `alpha_vantage` among `sources`.**
-  `transcripts=None` derives the last 4 completed calendar quarters from today
-  (`pull.last_completed_quarters`), but only when `alpha_vantage` is in the source
-  set — a restricted default pull such as `sources=["sec"]` stays transcript-free
-  rather than raising. `transcripts=[]` / `--transcripts none` opts out; an explicit
-  `YYYYQN` list overrides. Because the derived labels change every calendar quarter, a
-  plain pull's scope moves quarterly: the first plain pull after a rollover
-  re-acquires the whole source set (SEC ~22 requests, ~98 MB of originals, Yahoo,
-  estimates, one new transcript) — not just the new quarter. A quarter already held
-  costs 0.
-- 8-Ks need `sec` among `sources`, and `eight_ks` is part of the scope, so adding
-  (or changing) it is a fresh acquisition of the whole source set — not just the
-  filings, and not a cache hit for the 8-Ks alone.
-- A quarter that just ended may not be on Alpha Vantage yet: it is recorded
-  `MISSING`, and because the scope then caches, later plain pulls keep missing it.
-  Pass `--refresh` (or the explicit quarter label once it is posted) to retry.
-- A live pull spends real quota and minutes — `sec` is 22 requests for 11 filings,
-  Alpha Vantage's free tier is tightly limited, and preserved originals run to
-  ~98 MB per ticker. Tests never run one.
+- **Transcripts derive from reported quarters.** With `alpha_vantage` requested,
+  `transcripts=None` labels up to 12 distinct calendar quarters represented by held
+  SEC filing periods; on a first acquisition, labels come from that run's SEC filings.
+  A source set with no SEC evidence anywhere must provide explicit labels.
+  `transcripts=[]` / `--transcripts none` opts out. Held transcript quarters are
+  frozen and never re-asked, including on refresh; new calls are paced 1.5 seconds
+  apart (up to 12 per acquisition).
+- **Earnings releases are on by default.** `eight_ks=None` with `sec` requests 12
+  Item 2.02 releases; `eight_ks=0` opts out. To acquire a different depth, use
+  `refresh=True`; changing depth acquires the full requested source set.
+- **Serve before acquire.** Any ticker with held snapshots serves their verified
+  union with zero network, shaped by request filters. Only `refresh=True` acquires.
+  Since the canonical scope widened to 12 reported quarters and 12 releases, a held
+  ticker's first refresh may re-acquire the full source set once (~22 SEC requests,
+  ~98 MB originals, plus other requested sources).
+- A newly reported transcript may not yet be available from Alpha Vantage; it is
+  recorded as missing. Use `--refresh` to retry acquisition.
+- A live acquisition spends quota and minutes. Tests never run one.
