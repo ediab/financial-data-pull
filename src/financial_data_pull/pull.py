@@ -235,7 +235,7 @@ def held_transcript_quarters(issuer: str) -> dict[str, tuple[str, str | None]]:
     """company+quarter -> (the frozen snapshot holding it, its preserved original).
 
     A frozen transcript is evidence: a later acquisition reuses it rather than
-    re-pulling, so the provider is asked once per quarter unless `--refresh`. Both
+    re-pulling, so the provider is asked once per quarter — a refresh included. Both
     facts come from the one manifest already being read — no extra file reads.
     """
     held: dict[str, tuple[str, str | None]] = {}
@@ -527,7 +527,11 @@ def pull(ticker: str, *, issuer: str | None = None, sources=None, transcripts=No
             originals["av_earnings_estimates"] = av_meta["original_path"]
 
     # --- earnings-call transcripts: one quarter at a time, one row each ---
-    held = {} if refresh else held_transcript_quarters(issuer)
+    # A transcript quarter already held is frozen evidence: reuse it even on refresh,
+    # so a refreshed snapshot folds the held quarters in rather than re-asking the
+    # provider. Only quarters not held are fetched. (To force a re-pull of a held
+    # quarter, drop it from the store or pass a sources set without alpha_vantage.)
+    held = held_transcript_quarters(issuer)
     live_calls = 0
     segments: list[dict] = []
     missing: list[str] = []
