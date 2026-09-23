@@ -6,6 +6,10 @@ reads a patched HTTP response through the real provider code. The three success
 examples from the brief are covered — a repeat pull is CACHED with zero provider
 calls, a source set publishes its own snapshot and is not a cache hit for
 another, and a failing provider degrades to coverage rows instead of raising.
+
+The SEC double serves a configurable filing history: 12 reported quarters,
+AVGO-shaped (a fiscal year ending early November) and VRT-shaped (a calendar year),
+since otherwise every pull test can only ever see one filing per form.
 """
 from __future__ import annotations
 
@@ -27,8 +31,9 @@ import pandas as pd
 from financial_data_pull import contracts, store
 from financial_data_pull.cli import main
 from financial_data_pull.providers import alphavantage, sec, yahoo
-from financial_data_pull.pull import (QUARTER_LABEL, export_csv, last_completed_quarters,
-                                      manifest, pull, read_table, scope_key)
+from financial_data_pull.pull import (QUARTER_LABEL, _statements_from_sec, export_csv,
+                                      last_completed_quarters, manifest, pull, read_table,
+                                      scope_key)
 from financial_data_pull.pull import logger as pull_logger
 
 from test_store import _TempPlane
@@ -45,26 +50,220 @@ def _http(payload: dict) -> mock.MagicMock:
     return mock.MagicMock(side_effect=lambda *args, **kwargs: io.BytesIO(body))
 
 
-class _Sec:
-    """One retrievable filing per form; everything else is absent, as upstream reads it."""
+# --- the filing histories the tests model -----------------------------------------
+# A shape is a company's filing history plus the two lines that are not uniform across
+# issuers: the consolidated revenue label and the equity total's concept. Each form's
+# period ends are newest first, the order the acquisition loop asks its filings in.
+# Twelve reported quarters = 3 annual 10-Ks + 9 quarterly 10-Qs, which for AVGO (a
+# fiscal year ending early November) run 2023Q4..2026Q3 and for VRT (a calendar year)
+# 2023Q3..2026Q2.
+_AVGO_EQUITY = ("us-gaap_StockholdersEquity"
+                "IncludingPortionAttributableToNoncontrollingInterest")
+_REVENUE_CONCEPT = "us-gaap_RevenueFromContractWithCustomerExcludingAssessedTax"
+AVGO_SHAPE = {
+    "periods": {
+        "10-K": ["2025-11-02", "2024-11-03", "2023-10-29"],
+        "10-Q": ["2026-08-02", "2026-05-03", "2026-02-01",
+                 "2025-08-03", "2025-05-04", "2025-02-02",
+                 "2024-08-04", "2024-05-05", "2024-02-04"],
+    },
+    "revenue_label": "Total net revenue",
+    "equity_concept": _AVGO_EQUITY,
+}
+VRT_SHAPE = {
+    "periods": {
+        "10-K": ["2025-12-31", "2024-12-31", "2023-12-31"],
+        "10-Q": ["2026-06-30", "2026-03-31",
+                 "2025-09-30", "2025-06-30", "2025-03-31",
+                 "2024-09-30", "2024-06-30", "2024-03-31",
+                 "2023-09-30"],
+    },
+    "revenue_label": "Net sales",
+    "equity_concept": "us-gaap_StockholdersEquity",
+}
+# the one-filing-per-form shape every pre-existing test was written against
+_DEFAULT_SHAPE = {"periods": {"10-K": ["2025-01-31"], "10-Q": ["2025-01-31"]},
+                  "revenue_label": "Total revenue",
+                  "equity_concept": "us-gaap_StockholdersEquity"}
+# 2023Q3: the first quarter either named shape reports
+_ORDINAL_ZERO = 2023 * 4 + 2
+_FILING_LAG_DAYS = {"10-K": 60, "10-Q": 35}
+_RESTRICTED_CASH = 25_000_000
 
-    def __init__(self, fail: bool = False):
+
+def _reported_label(period_end: str) -> str:
+    """The `YYYYQN` a period end reports as: the calendar quarter containing it.
+
+    Both shapes name their fiscal quarters the calendar way (AVGO's August-end is
+    fiscal Q3, VRT's June-end Q2), which is the coincidence the brief's footnote
+    flags: the fixture does not model a January-year-end issuer.
+    """
+    return f"{period_end[:4]}Q{(int(period_end[5:7]) - 1) // 3 + 1}"
+
+
+def _quarter_index(period_end: str) -> int:
+    """A quarter's position on the calendar grid, so arithmetic never reads a label."""
+    return int(period_end[:4]) * 4 + (int(period_end[5:7]) - 1) // 3
+
+
+def _end_of(ends: dict, year: int, quarter: int) -> str:
+    """The period end of one calendar quarter.
+
+    The shape's own date when its history holds that filing; otherwise the same
+    quarter shifted off any date the shape does carry — a comparative column older
+    than the acquired window, whose date only has to land in the right quarter.
+    """
+    known = ends.get((year, quarter))
+    if known:
+        return known
+    anchor = next(iter(ends.values()))
+    months = 3 * (year * 4 + quarter - 1 - _quarter_index(anchor))
+    return (pd.Timestamp(anchor) + pd.DateOffset(months=months)).date().isoformat()
+
+
+def _model(period_end: str) -> dict[str, int]:
+    """One quarter of the modelled company in whole dollars — a pure function of the
+    quarter, so a comparative column and an own-period column agree by construction
+    and the checks' arithmetic (Assets = Liabilities + Equity, YTD = Σ Qn) holds."""
+    step = _quarter_index(period_end) - _ORDINAL_ZERO
+    equity = 20_000_000_000 + 500_000_000 * step
+    liabilities = 30_000_000_000 + 400_000_000 * step
+    return {"revenue": 6_000_000_000 + 250_000_000 * step,
+            "equity": equity, "liabilities": liabilities,
+            "assets": equity + liabilities,
+            "cash": 3_000_000_000 + 100_000_000 * step}
+
+
+def _ytd(ends: dict, period_end: str) -> int:
+    """Revenue for the fiscal year through this period: what a 10-Q's `(YTD)` states."""
+    year, quarter = int(period_end[:4]), (int(period_end[5:7]) - 1) // 3 + 1
+    return sum(_model(_end_of(ends, year, q))["revenue"] for q in range(1, quarter + 1))
+
+
+def _fy(ends: dict, year: int) -> int:
+    """Revenue for one full fiscal year: what a 10-K's `(FY)` column states."""
+    return sum(_model(_end_of(ends, year, q))["revenue"] for q in (1, 2, 3, 4))
+
+
+def _statement_row(concept: str, label: str, columns: list[str], values: list[int],
+                   dimension: bool = False) -> dict:
+    return {"concept": concept, "label": label, "dimension": dimension,
+            **dict(zip(columns, values))}
+
+
+def _frame(rows: list[dict], columns: list[str]) -> pd.DataFrame:
+    """A statement in the provider's shape: the reserved columns, then the filing's own
+    period columns in document order."""
+    return pd.DataFrame(rows, columns=["concept", "label", "dimension", *columns])
+
+
+def _statement_frames(shape: dict, ends: dict, form: str, period_end: str) -> dict:
+    """The three statements one filing carries, as edgartools hands them over.
+
+    A 10-Q states its own quarter against the prior-year comparative and the year to
+    date; a 10-K states the full year and its two comparatives. Balance sheets are
+    point-in-time (bare dates, own plus prior fiscal year end) and cash flow is
+    year-to-date only — the shapes the real frames carry, so the later checks are
+    exercised against what the providers actually return.
+    """
+    year, quarter = int(period_end[:4]), (int(period_end[5:7]) - 1) // 3 + 1
+    if form == "10-K":
+        fy_ends = [_end_of(ends, year - k, 4) for k in (0, 1, 2)]
+        income_cols = [f"{end} (FY)" for end in fy_ends]
+        income_values = [_fy(ends, year - k) for k in (0, 1, 2)]
+        cashflow_cols = income_cols
+        cashflow_values = [_model(end)["cash"] + _RESTRICTED_CASH for end in fy_ends]
+    else:
+        prior = _end_of(ends, year - 1, quarter)
+        income_cols = [f"{period_end} (Q{quarter})", f"{prior} (Q{quarter})",
+                       f"{period_end} (YTD)", f"{prior} (YTD)"]
+        income_values = [_model(period_end)["revenue"], _model(prior)["revenue"],
+                         _ytd(ends, period_end), _ytd(ends, prior)]
+        cashflow_cols = [f"{period_end} (YTD)", f"{prior} (YTD)"]
+        cashflow_values = [_model(period_end)["cash"] + _RESTRICTED_CASH,
+                           _model(prior)["cash"] + _RESTRICTED_CASH]
+    balance_cols = [period_end, _end_of(ends, year - 1, 4)]
+    snapshots = [_model(end) for end in balance_cols]
+    income = _frame(
+        [_statement_row(_REVENUE_CONCEPT, shape["revenue_label"], income_cols, income_values),
+         # a segment row shares the concept and is not the company total: `dimension`
+         _statement_row(_REVENUE_CONCEPT, "Products - Asia Pacific", income_cols,
+                        [v // 4 for v in income_values], dimension=True)],
+        income_cols)
+    balance = _frame(
+        [_statement_row("us-gaap_Assets", "Total assets", balance_cols,
+                        [m["assets"] for m in snapshots]),
+         _statement_row("us-gaap_Liabilities", "Total liabilities", balance_cols,
+                        [m["liabilities"] for m in snapshots]),
+         _statement_row(shape["equity_concept"], "Total stockholders' equity",
+                        balance_cols, [m["equity"] for m in snapshots]),
+         _statement_row("us-gaap_CashAndCashEquivalentsAtCarryingValue",
+                        "Cash and cash equivalents", balance_cols,
+                        [m["cash"] for m in snapshots])],
+        balance_cols)
+    cashflow = _frame(
+        [_statement_row("us-gaap_CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents",
+                        "Cash, cash equivalents and restricted cash at end of period",
+                        cashflow_cols, cashflow_values)],
+        cashflow_cols)
+    return {"income": income, "balance": balance, "cashflow": cashflow}
+
+
+def _filing_date(period_end: str, form: str) -> str:
+    """A filing lands after its period ends: ~5 weeks for a 10-Q, ~2 months for a 10-K."""
+    lag = pd.DateOffset(days=_FILING_LAG_DAYS.get(form, 60))
+    return (pd.Timestamp(period_end) + lag).date().isoformat()
+
+
+def _accession(form: str, index: int, period_end: str) -> str:
+    """A distinct accession per filing, in EDGAR's own shape."""
+    base = 100000 if form == "10-K" else 500000
+    return f"0000000000-{period_end[2:4]}-{base + index:06d}"
+
+
+class _Sec:
+    """SEC statements as the provider serves them: a configurable run of filings per
+    form, one filing per form by default.
+
+    `shape` names each form's period ends, newest first, with the labels that differ
+    across issuers; every filing then has its own period end, filing date, accession
+    and statements, so a 12-quarter shape is a realistic company record rather than one
+    filing repeated. `fail=True` raises for every filing, and an index past the shape's
+    history raises as upstream reads a filing that is not there.
+    """
+
+    def __init__(self, fail: bool = False, shape: dict | None = None):
         self.calls = 0
         self.fail = fail
+        self.shape = shape or _DEFAULT_SHAPE
+        self.periods = {form: list(ends)
+                        for form, ends in self.shape["periods"].items()}
+        # every quarter-end the history carries, so a comparative column names the date
+        # the filing that owns that quarter states rather than a recomputed one
+        self.ends = {(int(end[:4]), (int(end[5:7]) - 1) // 3 + 1): end
+                     for ends in self.periods.values() for end in ends}
+        self.frames = {form: [_statement_frames(self.shape, self.ends, form, end)
+                              for end in ends]
+                       for form, ends in self.periods.items()}
 
     def __call__(self, ticker, form, index=0, issuer=None, ceiling=None):
         self.calls += 1
-        if self.fail or index > 0:
+        history = self.periods.get(form) or []
+        if self.fail or index >= len(history):
             raise RuntimeError("no such filing")
         if ceiling:
             ceiling.spend("sec")
-        frame = pd.DataFrame({"concept": ["us-gaap_Revenues"], "2025-01-31 (FY)": [1.0]})
-        meta = {"ticker": ticker, "form": form, "filing_date": "2025-03-01",
-                "period_of_report": "2025-01-31", "accession": f"0000000{index}",
-                "retrieved_at": store.now_iso(), "as_of": "2025-01-31"}
+        period_end = history[index]
+        frames = self.frames[form][index]
+        meta = {"ticker": ticker, "form": form,
+                "filing_date": _filing_date(period_end, form),
+                "period_of_report": period_end,
+                "accession": _accession(form, index, period_end),
+                "statements": sorted(frames),
+                "retrieved_at": store.now_iso(), "as_of": period_end}
         if issuer:
             meta["original_path"] = str(store.save_raw(issuer, "sec", b"<filing/>", suffix=".txt"))
-        return {"income": frame}, meta
+        return dict(frames), meta
 
 
 class _Yahoo:
@@ -256,6 +455,81 @@ class _LogCapture(logging.Handler):
 
     def messages(self, level: int) -> list[str]:
         return [r.getMessage() for r in self.records if r.levelno == level]
+
+
+def test_the_sec_fixture_serves_a_twelve_quarter_avgo_history():
+    """The AVGO shape: 12 distinct reported quarters, 2023Q4..2026Q3, each filing its
+    own dates and statements, and arithmetic the later checks can rely on."""
+    with _TempPlane():
+        with mock.patch.object(sec, "statements", _Sec(shape=AVGO_SHAPE)):
+            tables, meta, _ = _statements_from_sec("AVGO", "AVGO", None, store.now_iso())
+    periods = [m["period_of_report"] for m in meta.values()]
+    assert len(periods) == len(set(periods)) == 12, periods
+    assert len({m["filing_date"] for m in meta.values()}) == 12, meta
+    assert len({m["accession"] for m in meta.values()}) == 12, meta
+    assert sorted({_reported_label(period) for period in periods}) == [
+        "2023Q4", "2024Q1", "2024Q2", "2024Q3", "2024Q4", "2025Q1",
+        "2025Q2", "2025Q3", "2025Q4", "2026Q1", "2026Q2", "2026Q3"], periods
+    # an AVGO quarter ends in early Feb/May/Aug/Nov, and the frame labels it so
+    assert "2026-08-02 (Q3)" in tables["income_quarterly_0"].columns
+    assert "2026-08-02 (YTD)" in tables["income_quarterly_0"].columns
+    assert "2025-11-02 (FY)" in tables["income_annual_0"].columns
+    assert "2026-08-02" in tables["balance_quarterly_0"].columns
+    # the ties the checks read: YTD = Σ quarters of its fiscal year, Assets = L + E
+    income = tables["income_quarterly_0"]
+    quarters = [tables[f"income_quarterly_{i}"].loc[0, column]
+                for i, column in ((2, "2026-02-01 (Q1)"), (1, "2026-05-03 (Q2)"),
+                                  (0, "2026-08-02 (Q3)"))]
+    assert income.loc[0, "2026-08-02 (YTD)"] == sum(quarters), quarters
+    balance = tables["balance_quarterly_0"]
+    assert balance.loc[0, "2026-08-02"] == (balance.loc[1, "2026-08-02"]
+                                             + balance.loc[2, "2026-08-02"])
+    # the segment row shares the concept with the consolidated one, marked as a segment
+    assert list(income["dimension"]) == [False, True], income
+    print("  the SEC fixture serves a twelve-quarter AVGO history ✓")
+
+
+def test_the_sec_fixture_serves_a_calendar_year_vrt_history():
+    """The VRT shape: calendar quarter ends, so the newest four reported quarters are
+    exactly the labels the old calendar rule derived."""
+    with _TempPlane():
+        with mock.patch.object(sec, "statements", _Sec(shape=VRT_SHAPE)):
+            tables, meta, _ = _statements_from_sec("VRT", "VRT", None, store.now_iso())
+    periods = [m["period_of_report"] for m in meta.values()]
+    assert len(periods) == len(set(periods)) == 12, periods
+    labels = sorted({_reported_label(period) for period in periods})
+    assert labels == ["2023Q3", "2023Q4", "2024Q1", "2024Q2", "2024Q3", "2024Q4",
+                      "2025Q1", "2025Q2", "2025Q3", "2025Q4", "2026Q1", "2026Q2"], labels
+    assert labels[-4:] == ["2025Q3", "2025Q4", "2026Q1", "2026Q2"], labels
+    assert "2026-06-30 (Q2)" in tables["income_quarterly_0"].columns
+    assert "2025-12-31" in tables["balance_quarterly_0"].columns
+    print("  the SEC fixture serves a calendar-year VRT history ✓")
+
+
+def test_the_sec_fixture_still_raises_for_a_filing_it_does_not_hold():
+    """The default stays one filing per form, a later index is absent as upstream reads
+    it, and a failing run claims no periods it never retrieved."""
+    with _TempPlane():
+        default = _Sec()
+        _, meta = default("NVDA", "10-K", 0)
+        assert meta["period_of_report"] == "2025-01-31", meta
+        for double, form, index in ((default, "10-K", 1), (default, "10-Q", 8),
+                                    (_Sec(fail=True, shape=AVGO_SHAPE), "10-K", 0),
+                                    (_Sec(shape={"periods": {"10-K": []},
+                                                "revenue_label": "Total revenue",
+                                                "equity_concept": "us-gaap_StockholdersEquity"}),
+                                     "10-K", 0)):
+            try:
+                double("NVDA", form, index)
+            except RuntimeError as exc:
+                assert "no such filing" in str(exc), exc
+            else:
+                raise AssertionError(f"{form} index {index} should be absent")
+        with mock.patch.object(sec, "statements", _Sec(fail=True, shape=AVGO_SHAPE)):
+            tables, meta, _ = _statements_from_sec("AVGO", "AVGO", None, store.now_iso())
+        assert tables == {}, tables
+        assert not any(m.get("period_of_report") for m in meta.values()), meta
+    print("  the SEC fixture still raises for a filing it does not hold ✓")
 
 
 def test_estimate_metadata_names_a_period_field_the_payload_carries():
@@ -1156,6 +1430,9 @@ def test_a_cache_only_hit_logs_cached_and_nothing_else():
 
 
 if __name__ == "__main__":
+    test_the_sec_fixture_serves_a_twelve_quarter_avgo_history()
+    test_the_sec_fixture_serves_a_calendar_year_vrt_history()
+    test_the_sec_fixture_still_raises_for_a_filing_it_does_not_hold()
     test_estimate_metadata_names_a_period_field_the_payload_carries()
     test_last_completed_quarters_follows_the_calendar()
     test_a_default_pull_derives_the_last_four_completed_quarters()
