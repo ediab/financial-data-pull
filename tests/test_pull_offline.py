@@ -19,7 +19,6 @@ import json
 import logging
 import sys
 from contextlib import ExitStack
-from datetime import date, datetime, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -32,7 +31,7 @@ from financial_data_pull import contracts, store
 from financial_data_pull.cli import main
 from financial_data_pull.providers import alphavantage, sec, yahoo
 from financial_data_pull.pull import (QUARTER_LABEL, _statements_from_sec, export_csv,
-                                      last_completed_quarters, manifest, pull, read_table,
+                                      manifest, pull, read_table, reported_quarters,
                                       scope_key)
 from financial_data_pull.pull import logger as pull_logger
 
@@ -549,48 +548,101 @@ def test_estimate_metadata_names_a_period_field_the_payload_carries():
     print("  estimate metadata names a period field the payload carries ✓")
 
 
-def test_last_completed_quarters_follows_the_calendar():
-    """The derived default: the quarter has to have *ended* to be asked for."""
-    # mid-quarter dates: the current quarter is not completed
-    assert last_completed_quarters(date(2026, 5, 10)) == \
-        ["2025Q2", "2025Q3", "2025Q4", "2026Q1"]
-    assert last_completed_quarters(date(2026, 2, 15)) == \
-        ["2025Q1", "2025Q2", "2025Q3", "2025Q4"]
-    assert last_completed_quarters(date(2026, 8, 7)) == \
-        ["2025Q3", "2025Q4", "2026Q1", "2026Q2"]
-    # first day of a quarter: the one that just ended counts as completed
-    assert last_completed_quarters(date(2026, 1, 1)) == \
-        ["2025Q1", "2025Q2", "2025Q3", "2025Q4"]
-    assert last_completed_quarters(date(2026, 4, 1)) == \
-        ["2025Q2", "2025Q3", "2025Q4", "2026Q1"]
-    # the last day of a quarter: that quarter has not ended yet
-    assert last_completed_quarters(date(2026, 3, 31)) == \
-        ["2025Q1", "2025Q2", "2025Q3", "2025Q4"]
-    print("  the last four completed quarters follow the calendar ✓")
+def test_reported_quarters_uses_filing_periods_and_skips_missing_entries():
+    periods = [period for history in AVGO_SHAPE["periods"].values() for period in history]
+    meta = {f"filing_{i}": {"period_of_report": period} for i, period in enumerate(periods)}
+    meta.update(failed={"status": "FAILED", "period_of_report": None},
+                absent={"status": "FAILED"}, nan={"period_of_report": float("nan")})
+    expected = ["2023Q4", "2024Q1", "2024Q2", "2024Q3", "2024Q4", "2025Q1",
+                "2025Q2", "2025Q3", "2025Q4", "2026Q1", "2026Q2", "2026Q3"]
+    assert reported_quarters(meta) == expected
+    assert reported_quarters({"a": {"period_of_report": "2025-12-31"},
+                              "b": {"period_of_report": "2025-03-31"},
+                              "duplicate": {"period_of_report": "2025-12-31"}},
+                             count=12) == ["2025Q1", "2025Q4"]
+    assert reported_quarters(meta, count=4) == ["2025Q4", "2026Q1", "2026Q2", "2026Q3"]
+    vrt = {f"filing_{i}": {"period_of_report": period}
+           for i, period in enumerate([*VRT_SHAPE["periods"]["10-K"],
+                                       *VRT_SHAPE["periods"]["10-Q"]])}
+    assert reported_quarters(vrt)[-4:] == ["2025Q3", "2025Q4", "2026Q1", "2026Q2"]
 
 
-def test_a_default_pull_derives_the_last_four_completed_quarters():
+def test_default_transcripts_without_sec_evidence_require_explicit_labels():
     with _TempPlane():
-        t = _Transcripts()
-        with _patched(_Sec(), _Yahoo(), _Estimates(), transcripts=t):
-            result = pull("NVDA")
-        expected = last_completed_quarters(datetime.now(timezone.utc).date())
+        with _patched(_Sec(), _Yahoo(), _Estimates()):
+            try:
+                pull("NVDA", sources=["alpha_vantage"])
+            except ValueError as exc:
+                assert str(exc) == (
+                    "transcripts=[…] required: no SEC evidence to derive reported quarters")
+            else:
+                raise AssertionError("a transcript scope without SEC evidence must be explicit")
+
+
+def test_a_first_pull_derives_twelve_transcript_quarters_from_its_sec_fetch():
+    with _TempPlane():
+        t, e = _Transcripts(), _EightK()
+        with _patched(_Sec(shape=AVGO_SHAPE), _Yahoo(), _Estimates(), e, transcripts=t):
+            result = pull("AVGO")
+        expected = ["2023Q4", "2024Q1", "2024Q2", "2024Q3", "2024Q4", "2025Q1",
+                    "2025Q2", "2025Q3", "2025Q4", "2026Q1", "2026Q2", "2026Q3"]
         assert result["status"] == "RETRIEVED", result
         assert t.quarters == expected, (t.quarters, expected)
-        rows = [r for r in _coverage(result)["rows"]
-                if str(r["dataset"]).startswith("av_transcript_")]
-        assert sorted(r["period"] for r in rows) == sorted(expected), rows
+        assert result["scope_key"] == scope_key(
+            "AVGO", "AVGO", ["sec", "alpha_vantage", "yahoo"], expected, 12)
+        assert result["eight_ks"] == 12 and e.counts == [12], (result, e.counts)
+        assert result["reported_quarters"] == expected
         assert "av_transcript" in result["table_hashes"], result["table_hashes"]
-        # an explicit empty list opts out, and its scope is not the derived one
-        assert result["scope_key"] != scope_key("NVDA", "NVDA",
-                                                ["sec", "alpha_vantage", "yahoo"], [])
-        print("  a plain pull derives the last four completed quarters ✓")
+        print("  a first pull derives 12 quarters from its own SEC fetch ✓")
+
+
+def test_held_sec_meta_drives_the_default_transcript_scope():
+    with _TempPlane():
+        sec_double, transcripts = _Sec(shape=AVGO_SHAPE), _Transcripts()
+        with _patched(sec_double, _Yahoo(), _Estimates(), transcripts=transcripts):
+            held = pull("AVGO", sources=["sec"], eight_ks=0)
+            sec_calls = sec_double.calls
+            acquired = pull("AVGO", sources=["alpha_vantage"])
+        expected = ["2023Q4", "2024Q1", "2024Q2", "2024Q3", "2024Q4", "2025Q1",
+                    "2025Q2", "2025Q3", "2025Q4", "2026Q1", "2026Q2", "2026Q3"]
+        assert held["status"] == acquired["status"] == "RETRIEVED", (held, acquired)
+        assert transcripts.quarters == expected, transcripts.quarters
+        assert acquired["scope_key"] == scope_key(
+            "AVGO", "AVGO", ["alpha_vantage"], expected)
+        assert sec_double.calls == sec_calls, "held filing metadata should be read offline"
+
+
+def test_held_vrt_meta_selects_the_expected_newest_four():
+    with _TempPlane():
+        transcripts = _Transcripts()
+        with _patched(_Sec(shape=VRT_SHAPE), _Yahoo(), _Estimates(),
+                      transcripts=transcripts):
+            held = pull("VRT", sources=["sec"], eight_ks=0)
+            result = pull("VRT", sources=["alpha_vantage"])
+        expected = ["2023Q3", "2023Q4", "2024Q1", "2024Q2", "2024Q3", "2024Q4",
+                    "2025Q1", "2025Q2", "2025Q3", "2025Q4", "2026Q1", "2026Q2"]
+        assert held["status"] == result["status"] == "RETRIEVED", (held, result)
+        assert transcripts.quarters == expected, transcripts.quarters
+        assert transcripts.quarters[-4:] == ["2025Q3", "2025Q4", "2026Q1", "2026Q2"]
+
+
+def test_short_sec_history_is_not_padded_and_is_reported():
+    shape = {"periods": {"10-K": ["2025-12-31", "2024-12-31"]},
+             "revenue_label": "Net sales", "equity_concept": "us-gaap_StockholdersEquity"}
+    with _TempPlane():
+        transcripts = _Transcripts()
+        with _patched(_Sec(shape=shape), _Yahoo(), _Estimates(), transcripts=transcripts):
+            result = pull("VRT", sources=["sec", "alpha_vantage"], eight_ks=0)
+        assert result["status"] == "RETRIEVED", result
+        assert transcripts.quarters == ["2024Q4", "2025Q4"], transcripts.quarters
+        assert result["reported_quarters_note"] == (
+            "2 reported quarter(s) available; scope was not padded"), result
 
 
 def test_a_restricted_default_pull_stays_transcript_free_and_does_not_raise():
     with _TempPlane():
         with _patched(_Sec(), _Yahoo(), _Estimates()):
-            result = pull("NVDA", sources=["sec"])
+            result = pull("NVDA", sources=["sec"], eight_ks=0)
         assert result["status"] == "RETRIEVED", result
         assert not any(str(r["dataset"]).startswith("av_transcript_")
                        for r in _coverage(result)["rows"])
@@ -602,14 +654,15 @@ def test_a_restricted_default_pull_stays_transcript_free_and_does_not_raise():
 def test_a_repeat_pull_is_cached_with_zero_provider_calls():
     with _TempPlane():
         s, y, a = _Sec(), _Yahoo(), _Estimates()
-        t = _Transcripts()
-        with _patched(s, y, a, transcripts=t):
+        t, e = _Transcripts(), _EightK()
+        with _patched(s, y, a, e, transcripts=t):
             first = pull("NVDA")
             asked = (s.calls, y.calls, a.calls, t.calls)
             second = pull("NVDA")
         assert first["status"] == "RETRIEVED", first
-        assert first["requests"] == {"sec": 2, "yahoo": 8, "alpha_vantage": 1,
-                                     "alpha_vantage_transcripts": 4}, first["requests"]
+        assert first["requests"] == {"sec": 4, "yahoo": 8, "alpha_vantage": 1,
+                                     "alpha_vantage_transcripts": 1}, first["requests"]
+        assert e.counts == [12] and first["eight_ks"] == 12
         assert second["status"] == "CACHED", second
         assert (s.calls, y.calls, a.calls, t.calls) == asked, \
             "a cached pull must ask no provider"
@@ -626,7 +679,7 @@ def test_each_source_set_publishes_its_own_snapshot():
         s, y, a = _Sec(), _Yahoo(), _Estimates()
         with _patched(s, y, a):
             yahoo_only = pull("NVDA", sources=["yahoo"])
-            sec_only = pull("NVDA", sources=["sec"])
+            sec_only = pull("NVDA", sources=["sec"], eight_ks=0)
             again = pull("NVDA", sources=["yahoo"])
         assert len(store.snapshot_dirs("NVDA")) == 2, "one scope, one snapshot"
         assert set(yahoo_only["table_hashes"]) == set(yahoo.DATASETS), yahoo_only["table_hashes"]
@@ -793,7 +846,7 @@ def test_an_alpha_vantage_message_is_redacted_before_it_reaches_an_artifact():
             # code, reading a patched response, or the redaction is never exercised
             with mock.patch.object(alphavantage.urllib.request, "urlopen",
                                    _http({"Information": message})):
-                estimates = pull("NVDA", sources=["alpha_vantage"])
+                estimates = pull("NVDA", sources=["alpha_vantage"], transcripts=[])
                 transcripts = pull("NVDA", sources=["alpha_vantage"],
                                    transcripts=["2025Q1"])
         for result, dataset in ((estimates, "av_earnings_estimates"),
@@ -808,7 +861,7 @@ def test_an_alpha_vantage_message_is_redacted_before_it_reaches_an_artifact():
 def test_a_bogus_ticker_records_gaps_and_publishes_no_snapshot():
     with _TempPlane():
         s, y, a = _Sec(fail=True), _Yahoo(fail=True), _Estimates(fail=True)
-        with _patched(s, y, a, transcripts=_Transcripts(fail=True)):
+        with _patched(s, y, a, _EightK(fail=True), transcripts=_Transcripts(fail=True)):
             result = pull("ZZZZ")
         assert result["status"] == "FAILED", result
         doc = _coverage(result)
@@ -830,7 +883,7 @@ def test_a_failed_run_is_not_cached_and_the_scope_recovers():
     """The cache has no TTL: a run that retrieved nothing must not read back CACHED."""
     with _TempPlane():
         s, y, a = _Sec(fail=True), _Yahoo(fail=True), _Estimates(fail=True)
-        with _patched(s, y, a, transcripts=_Transcripts(fail=True)):
+        with _patched(s, y, a, _EightK(fail=True), transcripts=_Transcripts(fail=True)):
             failed = pull("NVDA")
             asked = (s.calls, y.calls, a.calls)
             again = pull("NVDA")
@@ -994,7 +1047,7 @@ def test_the_cli_exits_non_zero_when_nothing_was_published():
     with _TempPlane():
         err = io.StringIO()
         with _patched(_Sec(fail=True), _Yahoo(fail=True), _Estimates(fail=True),
-                      transcripts=_Transcripts(fail=True)), \
+                      _EightK(fail=True), transcripts=_Transcripts(fail=True)), \
                 mock.patch("sys.stdout", new_callable=io.StringIO), mock.patch("sys.stderr", err):
             assert main(["ZZZZ"]) == 1, "a run that acquired nothing must not exit 0"
         assert "FAILED — nothing published" in err.getvalue().splitlines(), err.getvalue()
@@ -1022,7 +1075,7 @@ def test_the_cli_prints_the_run_status_to_stderr():
 
         out, err = io.StringIO(), io.StringIO()
         with _patched(_Sec(fail=True), _Yahoo(fail=True), _Estimates(fail=True),
-                      transcripts=_Transcripts(fail=True)), \
+                      _EightK(fail=True), transcripts=_Transcripts(fail=True)), \
                 mock.patch("sys.stdout", out), mock.patch("sys.stderr", err):
             assert main(["NVDA"]) == 0, "the held scope is a cache hit"
         assert f"CACHED — evidence already held, zero network (snapshot {run_id})" \
@@ -1040,7 +1093,7 @@ def test_the_cli_prints_the_run_status_to_stderr():
         # stdout alone; the non-quiet run still logs its progress
         out, err = io.StringIO(), io.StringIO()
         with _patched(_Sec(fail=True), _Yahoo(fail=True), _Estimates(fail=True),
-                      transcripts=_Transcripts(fail=True)), \
+                      _EightK(fail=True), transcripts=_Transcripts(fail=True)), \
                 _LogCapture(pull_logger) as log, \
                 mock.patch("sys.stdout", out), mock.patch("sys.stderr", err):
             assert main(["NVDA", "--quiet"]) == 0
@@ -1049,7 +1102,7 @@ def test_the_cli_prints_the_run_status_to_stderr():
         assert log.messages(logging.INFO) == [], log.messages(logging.INFO)
         out, err = io.StringIO(), io.StringIO()
         with _patched(_Sec(fail=True), _Yahoo(fail=True), _Estimates(fail=True),
-                      transcripts=_Transcripts(fail=True)), \
+                      _EightK(fail=True), transcripts=_Transcripts(fail=True)), \
                 _LogCapture(pull_logger) as log, \
                 mock.patch("sys.stdout", out), mock.patch("sys.stderr", err):
             assert main(["NVDA"]) == 0
@@ -1070,9 +1123,8 @@ def test_a_transcript_label_that_is_not_a_quarter_is_refused_at_the_boundary():
             raise AssertionError("a bogus quarter label must be refused")
         assert (s.calls, y.calls, a.calls, t.calls) == (0, 0, 0, 0), \
             "the refusal must precede any provider call"
-        # the derived default always names valid quarters — the sentinel cannot leak in
-        assert all(QUARTER_LABEL.fullmatch(q)
-                   for q in last_completed_quarters(date(2026, 5, 10)))
+        assert all(QUARTER_LABEL.fullmatch(q) for q in reported_quarters({
+            "filing": {"period_of_report": "2026-08-02"}}))
     print("  a transcript label that is not a quarter is refused before any request ✓")
 
 
@@ -1185,7 +1237,7 @@ def test_eight_k_filings_are_archived_per_filing_and_scoped_by_depth():
             early = export_csv("NVDA")                      # the deep run is the latest here
             shallow = pull("NVDA", sources=["sec"], eight_ks=1)
             again = pull("NVDA", sources=["sec"], eight_ks=1)
-            without = pull("NVDA", sources=["sec"])
+            without = pull("NVDA", sources=["sec"], eight_ks=0)
         assert deep["status"] == "RETRIEVED" and deep["eight_ks"] == 3, deep
         frame = read_table("NVDA", "sec_8k", run_id=Path(deep["snapshot_dir"]).name)
         assert list(frame["accession"]) == ["0000000000-25-000010",
@@ -1434,8 +1486,12 @@ if __name__ == "__main__":
     test_the_sec_fixture_serves_a_calendar_year_vrt_history()
     test_the_sec_fixture_still_raises_for_a_filing_it_does_not_hold()
     test_estimate_metadata_names_a_period_field_the_payload_carries()
-    test_last_completed_quarters_follows_the_calendar()
-    test_a_default_pull_derives_the_last_four_completed_quarters()
+    test_reported_quarters_uses_filing_periods_and_skips_missing_entries()
+    test_default_transcripts_without_sec_evidence_require_explicit_labels()
+    test_a_first_pull_derives_twelve_transcript_quarters_from_its_sec_fetch()
+    test_held_sec_meta_drives_the_default_transcript_scope()
+    test_held_vrt_meta_selects_the_expected_newest_four()
+    test_short_sec_history_is_not_padded_and_is_reported()
     test_a_restricted_default_pull_stays_transcript_free_and_does_not_raise()
     test_a_repeat_pull_is_cached_with_zero_provider_calls()
     test_each_source_set_publishes_its_own_snapshot()

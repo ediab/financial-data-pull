@@ -20,7 +20,7 @@ import logging
 import re
 import time
 import uuid
-from datetime import date, datetime, timezone
+from datetime import date
 from pathlib import Path
 
 import pandas as pd
@@ -59,23 +59,41 @@ POINT_IN_TIME = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 QUARTER_LABEL = re.compile(r"\d{4}Q[1-4]")
 
 
-def last_completed_quarters(today: date, count: int = 4) -> list[str]:
-    """The `YYYYQN` labels of the `count` most recent *completed* calendar quarters.
+def reported_quarters(filings_meta: dict, count: int = 12) -> list[str]:
+    """Return distinct calendar-quarter labels represented by filing period ends.
 
-    "Completed" is strict: on the last day of a quarter that quarter has not ended
-    yet, so it is not included, while on the first day of a quarter the one that just
-    ended is. The labels are oldest first (newest last), the order the acquisition
-    loop asks them in. The label is the *calendar* quarter: a fiscal-offset issuer
-    whose provider labels differ must be asked for explicitly.
+    Missing or invalid period ends are ignored (notably failed filings). The newest
+    `count` labels are selected, then returned oldest first for transcript acquisition.
     """
-    year, quarter = today.year, (today.month - 1) // 3 + 1
-    labels: list[str] = []
-    for _ in range(count):
-        quarter -= 1
-        if quarter == 0:
-            quarter, year = 4, year - 1
-        labels.append(f"{year}Q{quarter}")
-    return labels[::-1]
+    labels = set()
+    for filing in filings_meta.values():
+        period = filing.get("period_of_report") if isinstance(filing, dict) else None
+        if period is None or pd.isna(period):
+            continue
+        try:
+            end = date.fromisoformat(str(period)[:10])
+        except (TypeError, ValueError):
+            continue
+        labels.add(f"{end.year}Q{(end.month - 1) // 3 + 1}")
+    return sorted(labels, reverse=True)[:count][::-1]
+
+
+def _held_sec_filings(issuer: str, ticker: str) -> dict:
+    """The newest ticker-matching published SEC filing metadata, if any."""
+    for snap in reversed(store.snapshot_dirs(issuer)):
+        manifest_path = snap / "snapshot.json"
+        if not manifest_path.is_file():
+            continue
+        try:
+            held_manifest = json.loads(manifest_path.read_text())
+        except (json.JSONDecodeError, OSError):
+            continue
+        if held_manifest.get("ticker") != ticker:
+            continue
+        filings = ((held_manifest.get("providers") or {}).get("sec") or {}).get("filings")
+        if isinstance(filings, dict):
+            return filings
+    return {}
 
 
 def _period_labels(df: pd.DataFrame | None, dataset: str = "") -> list[str]:
@@ -346,11 +364,11 @@ def pull(ticker: str, *, issuer: str | None = None, sources=None, transcripts=No
     refresh: ADDS a new snapshot version; published snapshots are never touched.
 
     `eight_ks` names how many of the most recent Item 2.02 earnings 8-Ks to archive
-    with their Exhibit 99.1; it comes from the sec source and is part of the scope,
-    so a run of a different depth is a miss rather than a silently thinner answer.
-    `transcripts` is left as `None` for the default: when alpha_vantage is among the
-    sources the last four completed calendar quarters are acquired, so a caller need
-    not know a quarter label. An explicit list names the quarters, and `[]` opts out.
+    with their Exhibit 99.1; `None` defaults to 12 when `sec` is requested, and 0
+    opts out. `transcripts` is left as `None` for the default: when alpha_vantage is
+    among the sources, its quarters derive from held SEC filing periods, or from this
+    run's SEC fetch on a first acquisition. Without SEC evidence, pass explicit labels.
+    An explicit list names the quarters, and `[]` opts out.
     `ceilings` names per-provider request limits to enforce, for example
     {"alpha_vantage": 10}. Requests are counted and returned either way.
     """
@@ -360,12 +378,32 @@ def pull(ticker: str, *, issuer: str | None = None, sources=None, transcripts=No
     for source in sources:
         if source not in SOURCES:
             raise ValueError(f"unknown source {source!r}; expected one of {list(SOURCES)}")
-    if transcripts is None and "alpha_vantage" in sources:
-        # a plain pull follows the calendar: the last four completed quarters, so an
-        # agent need not know a quarter label. A source set without alpha_vantage has
-        # no transcript provider to ask, so it stays transcript-free rather than
-        # raising — an explicit `transcripts=[]` is still an opt-out.
-        transcripts = last_completed_quarters(datetime.now(timezone.utc).date())
+    issuer = issuer or ticker
+    store.safe_component(issuer, "issuer")
+    if cache_only and refresh:
+        raise ValueError("cache_only and refresh cannot be combined")
+    if eight_ks is None:
+        eight_ks = 12 if "sec" in sources else 0
+    eight_ks = int(eight_ks)
+    if eight_ks < 0:
+        raise ValueError("eight_ks is a count of filings and cannot be negative")
+    derived_transcripts = transcripts is None and "alpha_vantage" in sources
+    sec_prefetched = None
+    if derived_transcripts:
+        held_filings = _held_sec_filings(issuer, ticker)
+        transcripts = reported_quarters(held_filings)
+        if not transcripts:
+            if "sec" not in sources:
+                raise ValueError(
+                    "transcripts=[…] required: no SEC evidence to derive reported quarters")
+            if cache_only:
+                return {"status": "MISSING: NOT_RETRIEVED", "issuer": issuer}
+            # A first-ever pull must fetch SEC before its scope can be named. Reuse this
+            # fetch below rather than spending the filing requests twice.
+            ceiling = Ceiling(ceilings or {})
+            retrieved_at = store.now_iso()
+            sec_prefetched = _statements_from_sec(issuer, ticker, ceiling, retrieved_at)
+            transcripts = reported_quarters(sec_prefetched[1])
     # a repeated quarter would spend a second request and write a second coverage row
     transcripts = list(dict.fromkeys(q for q in (transcripts or []) if q))
     # a label the provider cannot name would spend a real request and record a MISSING
@@ -373,17 +411,10 @@ def pull(ticker: str, *, issuer: str | None = None, sources=None, transcripts=No
     bad_labels = [q for q in transcripts if not QUARTER_LABEL.fullmatch(q)]
     if bad_labels:
         raise ValueError(f"transcript labels must be YYYYQN, got {bad_labels!r}")
-    eight_ks = int(eight_ks or 0)
-    if eight_ks < 0:
-        raise ValueError("eight_ks is a count of filings and cannot be negative")
-    if cache_only and refresh:
-        raise ValueError("cache_only and refresh cannot be combined")
     if transcripts and "alpha_vantage" not in sources:
         raise ValueError("transcripts come from alpha_vantage; name it in sources")
     if eight_ks and "sec" not in sources:
         raise ValueError("8-Ks come from sec; name it in sources")
-    issuer = issuer or ticker
-    store.safe_component(issuer, "issuer")
     key = scope_key(issuer, ticker, sources, transcripts, eight_ks)
 
     if cache_only:
@@ -414,7 +445,8 @@ def pull(ticker: str, *, issuer: str | None = None, sources=None, transcripts=No
             }
         logger.info("no snapshot held for scope %s", key)
 
-    ceiling = Ceiling(ceilings or {})
+    if sec_prefetched is None:
+        ceiling = Ceiling(ceilings or {})
     run_id = f"{store.now_iso().replace(':', '')}-{uuid.uuid4().hex[:6]}"
     retrieved_at = store.now_iso()
     rows: list[dict] = []
@@ -424,7 +456,8 @@ def pull(ticker: str, *, issuer: str | None = None, sources=None, transcripts=No
 
     # --- statements (SEC/edgartools, originals preserved per filing) ---
     if "sec" in sources:
-        st_tables, st_meta, st_rows = _statements_from_sec(issuer, ticker, ceiling, retrieved_at)
+        st_tables, st_meta, st_rows = (sec_prefetched if sec_prefetched is not None else
+                                       _statements_from_sec(issuer, ticker, ceiling, retrieved_at))
         tables.update(st_tables)
         rows.extend(st_rows)
         provider_meta["sec"] = {"status": "RETRIEVED" if st_tables else "FAILED", "filings": st_meta}
@@ -435,7 +468,7 @@ def pull(ticker: str, *, issuer: str | None = None, sources=None, transcripts=No
                                 and filing_meta.get("status") != "FAILED")
         logger.info("sec: %d filings, %d tables", retrieved_filings, len(st_tables))
 
-        # --- earnings 8-Ks (opt-in): Item 2.02 filings and their press releases ---
+        # --- earnings 8-Ks: Item 2.02 filings and their press releases ---
         if eight_ks:
             try:
                 eight_frame, eight_meta = sec.earnings_8k(ticker, eight_ks, issuer=issuer,
@@ -604,6 +637,11 @@ def pull(ticker: str, *, issuer: str | None = None, sources=None, transcripts=No
 
     result = _publish_snapshot(ticker, issuer, sources, transcripts, eight_ks, key, run_id,
                                retrieved_at, rows, tables, provider_meta, originals)
+    if derived_transcripts:
+        result["reported_quarters"] = transcripts
+        if len(transcripts) < 12:
+            result["reported_quarters_note"] = (
+                f"{len(transcripts)} reported quarter(s) available; scope was not padded")
     return {**result, "requests": ceiling.used}
 
 

@@ -63,7 +63,8 @@ def test_a_sec_yahoo_or_alpha_vantage_breach_raises_out_of_pull():
                                     (["yahoo"], {"yahoo": 3}),
                                     (["alpha_vantage"], {"alpha_vantage": 0})):
                 exc = _refusal(lambda src=sources, lim=limits:
-                               pull("NVDA", sources=src, ceilings=lim))
+                               pull("NVDA", sources=src, ceilings=lim,
+                                    transcripts=[] if "alpha_vantage" in src else None))
                 assert "ceiling exceeded" in str(exc), (sources, exc)
                 assert store.snapshot_dirs("NVDA") == [], "a breached run publishes nothing"
     print("  a breach of a named live source raises and publishes nothing ✓")
