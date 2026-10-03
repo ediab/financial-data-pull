@@ -26,6 +26,24 @@ details.
 
 `.env` holds live API keys. It is gitignored and never packaged.
 
+## Secrets (where to put them)
+
+Edit the `.env` file you copied above — the app loads it automatically:
+
+```sh
+# .env   (repo root, never commit it)
+EDGAR_IDENTITY="Your Name your-email@example.com"
+ALPHAVANTAGE_API_KEY=your-key-here
+```
+
+- `EDGAR_IDENTITY` — free, just your name and email. SEC asks for a declared
+  identity on every EDGAR request.
+- `ALPHAVANTAGE_API_KEY` — free key from https://www.alphavantage.co/support/#api-key
+  (needed for analyst estimates and earnings-call transcripts).
+
+Never paste keys into code or the terminal — only into `.env`. If a dataset comes
+back `NOT_SUPPLIED`, the matching key is absent or misfilled.
+
 ## Use
 
 ```sh
